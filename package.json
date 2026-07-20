@@ -1,0 +1,23 @@
+{
+  "name": "clone-hero-converter-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "install-all": "npm install",
+    "start-backend": "npm start --prefix backend",
+    "build-frontend": "npm run build --prefix frontend",
+    "start-frontend": "npm run dev --prefix frontend"
+  },
+  "dependencies": {
+    "ffmpeg": "^0.0.4",
+    "ffprobe": "^1.1.2",
+    "fluent-ffmpeg": "^2.1.3"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
+  }
+}
