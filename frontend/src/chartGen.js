@@ -3,6 +3,8 @@
 // tempoAnalysis.js so both surfaces produce byte-identical charts from the same
 // logic. Everything works in the 480-PPQ tick domain the exporter expects.
 
+import { applySustainHygiene } from './sustain.js';
+
 // --- Preset pitch -> mapping ------------------------------------------------
 
 // Default mapping for a MIDI pitch given the target instrument. Drums use the
@@ -33,6 +35,24 @@ export const presetMappingForPitch = (pitch, isDrums) => {
 };
 
 export const isDrumsSection = (targetSection) => targetSection.toLowerCase().includes('drum');
+
+// Canonical difficulty/instrument naming. Reference charts emit note sections
+// in this order: all guitar difficulties, then bass, then drums.
+export const DIFFICULTIES = ['Expert', 'Hard', 'Medium', 'Easy'];
+export const INSTRUMENTS = ['Single', 'DoubleBass', 'Drums'];
+export const SECTION_ORDER = INSTRUMENTS.flatMap(inst => DIFFICULTIES.map(d => d + inst));
+
+export const sectionName = (difficulty, instrument) => `${difficulty}${instrument}`;
+
+// "HardDoubleBass" -> { difficulty: 'Hard', instrument: 'DoubleBass' }.
+// Unknown names fall back to Expert + the name itself so legacy custom section
+// strings (e.g. "ExpertDoubleGuitar") still round-trip.
+export const parseSectionName = (name) => {
+  for (const d of DIFFICULTIES) {
+    if (name.startsWith(d)) return { difficulty: d, instrument: name.slice(d.length) || 'Single' };
+  }
+  return { difficulty: 'Expert', instrument: name };
+};
 
 export const getLaneNoteIndex = (mapping) => {
   switch (mapping) {
@@ -82,7 +102,7 @@ export const measureTicksFromTS = (ts) => {
 export const generateStarPowerPhrases = (noteEvents, { measureTicks, densityMeasures, minNotes = 3, maxPhraseMeasures = 2 }) => {
   const onsets = [...new Set(
     noteEvents
-      .filter(e => e.type === 'N' && !(e.value === 66 || e.value === 67 || e.value === 68))
+      .filter(e => e.type === 'N' && !(e.value === 32 || e.value === 66 || e.value === 67 || e.value === 68))
       .map(e => e.tick)
   )].sort((a, b) => a - b);
 
@@ -124,7 +144,8 @@ export const generateStarPowerPhrases = (noteEvents, { measureTicks, densityMeas
 // (pairId/mappedType/originalPitch) that the app uses and the writer ignores.
 export const compileChartEvents = ({
   parsedMidi, trackIndex, pitchMappings, drumSyncOffset,
-  effectiveBPM, targetSection, autoStarPower = false, spDensityMeasures = 8
+  effectiveBPM, targetSection, autoStarPower = false, spDensityMeasures = 8,
+  applySustainRules = true
 }) => {
   const track = parsedMidi.tracks[trackIndex];
   if (!track) return [];
@@ -173,22 +194,50 @@ export const compileChartEvents = ({
   }
 
   compiledEvents.sort((a, b) => a.tick - b.tick);
-  return compiledEvents;
+  // Raw MIDI durations make poor sustains (legato bleeds into the next note,
+  // grace-note lengths render as stub sustains) — clean them up for guitar/bass.
+  return (applySustainRules && !drumsMode) ? applySustainHygiene(compiledEvents) : compiledEvents;
 };
 
 // --- .chart text ------------------------------------------------------------
 
-// Build the full notes.chart text. autoSync (optional) is the fitted multi-BPM
-// map { bpmEvents: [{tick,bpm}] }; when absent the MIDI tempos are scaled by
-// effectiveBPM/midiBPM.
+// Build the full notes.chart text.
+//   autoSync (optional): fitted multi-BPM map { bpmEvents: [{tick,bpm}] }; when
+//     absent the MIDI tempos are scaled by effectiveBPM/midiBPM.
+//   songMeta (optional): { name, artist, charter, album, year, genre, offset,
+//     previewStart, previewEnd, musicStream } -> full [Song] block matching the
+//     reference-chart key set. Absent -> legacy two-line stub.
+//   sectionEvents (optional): [{ tick, name }] practice sections for [Events].
+//   noteSections (optional): [{ section, events }] emitted in SECTION_ORDER;
+//     when absent, legacy single targetSection + chartEvents is used.
 export const generateChartString = ({
-  parsedMidi, chartEvents, targetSection, effectiveBPM, midiBPM, drumSyncOffset, autoSync
+  parsedMidi, chartEvents, targetSection, effectiveBPM, midiBPM, drumSyncOffset, autoSync,
+  songMeta, sectionEvents, noteSections
 }) => {
   const lines = [];
   lines.push('[Song]');
   lines.push('{');
-  lines.push('  Resolution = 480');
-  lines.push('  MusicStream = "song.ogg"');
+  if (songMeta) {
+    const q = (s) => `"${String(s == null ? '' : s).replace(/"/g, "'")}"`;
+    lines.push(`  Name = ${q(songMeta.name || 'Custom Chart')}`);
+    lines.push(`  Artist = ${q(songMeta.artist || 'Various Artists')}`);
+    lines.push(`  Charter = ${q(songMeta.charter || '')}`);
+    lines.push(`  Album = ${q(songMeta.album || '')}`);
+    // GH-era quirk kept by the reference charts: Year = ", 2002"
+    lines.push(`  Year = ${q(songMeta.year ? `, ${songMeta.year}` : '')}`);
+    lines.push(`  Offset = ${songMeta.offset || 0}`);
+    lines.push('  Resolution = 480');
+    lines.push('  Player2 = bass');
+    lines.push('  Difficulty = 0');
+    lines.push(`  PreviewStart = ${songMeta.previewStart || 0}`);
+    lines.push(`  PreviewEnd = ${songMeta.previewEnd || 0}`);
+    lines.push(`  Genre = ${q(songMeta.genre || 'Custom')}`);
+    lines.push('  MediaType = "cd"');
+    lines.push(`  MusicStream = ${q(songMeta.musicStream || 'song.ogg')}`);
+  } else {
+    lines.push('  Resolution = 480');
+    lines.push('  MusicStream = "song.ogg"');
+  }
   lines.push('}');
 
   lines.push('[SyncTrack]');
@@ -244,26 +293,48 @@ export const generateChartString = ({
 
   lines.push('[Events]');
   lines.push('{');
+  if (sectionEvents && sectionEvents.length > 0) {
+    [...sectionEvents].sort((a, b) => a.tick - b.tick).forEach(s => {
+      lines.push(`  ${s.tick} = E "section ${String(s.name).replace(/"/g, "'")}"`);
+    });
+  }
   lines.push('}');
 
-  lines.push(`[${targetSection}]`);
-  lines.push('{');
+  // Multi-section form, or the legacy single targetSection + chartEvents pair.
+  const sections = (noteSections && noteSections.length > 0)
+    ? [...noteSections].sort((a, b) => {
+        const ia = SECTION_ORDER.indexOf(a.section), ib = SECTION_ORDER.indexOf(b.section);
+        return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+      })
+    : [{ section: targetSection, events: chartEvents }];
 
-  const sorted = [...chartEvents].sort((a, b) => {
-    if (a.tick !== b.tick) return a.tick - b.tick;
-    return a.value - b.value;
+  sections.forEach(({ section, events }) => {
+    lines.push(`[${section}]`);
+    lines.push('{');
+
+    const sorted = [...events].sort((a, b) => {
+      if (a.tick !== b.tick) return a.tick - b.tick;
+      return a.value - b.value;
+    });
+
+    sorted.forEach(evt => {
+      if (evt.type === 'S') lines.push(`  ${evt.tick} = S 2 ${evt.duration}`);
+      else lines.push(`  ${evt.tick} = N ${evt.value} ${evt.duration}`);
+    });
+
+    lines.push('}');
   });
 
-  sorted.forEach(evt => {
-    if (evt.type === 'S') lines.push(`  ${evt.tick} = S 2 ${evt.duration}`);
-    else lines.push(`  ${evt.tick} = N ${evt.value} ${evt.duration}`);
-  });
-
-  lines.push('}');
   return lines.join('\n');
 };
 
 // --- song.ini ---------------------------------------------------------------
 
-export const generateSongIni = ({ title, artist, charter, musicStream = 'song.ogg', songLengthMs = 180000 }) =>
-  `[song]\nname = ${title || 'Custom Chart'}\nartist = ${artist || 'Various Artists'}\ncharter = ${charter || 'Master Utility'}\nalbum = Custom Single\nyear = 2026\ngenre = Custom\nplaylist_track = 1\nsong_length = ${Math.round(songLengthMs)}\npreview_start_time = 30000\ndelay = 0\nmusic_stream = ${musicStream}\npro_drums = True\ndiff_drums = 3\ndiff_guitar = 3\nsysex_slider = True\nmultiplier_note = 116\n`;
+// diff_* follow the reference charts' convention: every instrument listed, -1
+// when the chart carries no notes for it.
+export const generateSongIni = ({
+  title, artist, charter, musicStream = 'song.ogg', songLengthMs = 180000,
+  album = 'Custom Single', genre = 'Custom', year = 2026, previewStartMs = 30000,
+  diffGuitar = 3, diffBass = -1, diffDrums = 3
+}) =>
+  `[song]\nname = ${title || 'Custom Chart'}\nartist = ${artist || 'Various Artists'}\ncharter = ${charter || 'Master Utility'}\nalbum = ${album}\nyear = ${year}\ngenre = ${genre}\nplaylist_track = 1\nsong_length = ${Math.round(songLengthMs)}\npreview_start_time = ${Math.round(previewStartMs)}\ndelay = 0\nmusic_stream = ${musicStream}\npro_drums = True\ndiff_drums = ${diffDrums}\ndiff_guitar = ${diffGuitar}\ndiff_bass = ${diffBass}\nsysex_slider = True\nmultiplier_note = 116\n`;
