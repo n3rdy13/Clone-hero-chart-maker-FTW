@@ -30,8 +30,11 @@ import {
   isDrumsSection,
   compileChartEvents,
   generateChartString as buildChartString,
-  generateSongIni as buildSongIni
+  generateSongIni as buildSongIni,
+  measureTicksFromTS
 } from './chartGen';
+import { buildAllDifficulties, computeForcedFlags } from './difficultyReduction';
+import { generatePracticeSections } from './sections';
 import { padAudioBuffer, audioBufferToWav } from './audioUtil';
 import BatchConverter from './BatchConverter';
 
@@ -100,6 +103,23 @@ export default function App() {
   const [iniTitle, setIniTitle] = useState('');
   const [iniArtist, setIniArtist] = useState('');
   const [iniCharter, setIniCharter] = useState('CharterMaster');
+  const [iniAlbum, setIniAlbum] = useState('');
+  const [iniGenre, setIniGenre] = useState('');
+  const [iniYear, setIniYear] = useState('');
+
+  // Chart-quality options: auto-generate Hard/Medium/Easy from the Expert
+  // events, forced-strum downbeat HOPOs, and auto practice sections.
+  const [exportAllDifficulties, setExportAllDifficulties] = useState(true);
+  const [hopoMode, setHopoMode] = useState('natural'); // 'natural' | 'strum-downbeats'
+  const [practiceSections, setPracticeSections] = useState([]);
+
+  // Additional instruments locked into the chart (multi-instrument export):
+  // [{ instrument: 'Single'|'DoubleBass'|'Drums', events }]
+  const [lockedInstruments, setLockedInstruments] = useState([]);
+
+  // Onset-envelope bands retained from the last auto-sync run (used for
+  // audio-novelty practice-section detection).
+  const bandsRef = useRef(null);
 
   // Input & Mapping States
   const [selectedTrackIndex, setSelectedTrackIndex] = useState(0);
@@ -344,6 +364,7 @@ export default function App() {
 
       const { bands, fps } = await computeOnsetEnvelope(mono, buf.sampleRate,
         p => setAutoSyncProgress(Math.round(p * 40)));
+      bandsRef.current = { bands, fps }; // reused for practice-section detection
 
       const sourcePPQ = parsedMidi.header.ppq || 480;
       const hits = track.notes.map(n => ({
@@ -457,6 +478,37 @@ export default function App() {
       spDensityMeasures
     }));
   }, [parsedMidi, selectedTrackIndex, pitchMappings, drumSyncOffset, targetChartSection, actualBPM, autoStarPower, spDensityMeasures]);
+
+  const getMeasureTicks = () => {
+    const ts = (parsedMidi && parsedMidi.header.timeSignatures && parsedMidi.header.timeSignatures.length > 0)
+      ? parsedMidi.header.timeSignatures[0].timeSignature : [4, 4];
+    return measureTicksFromTS(ts);
+  };
+
+  // Chart instrument of a section name ("ExpertDrums" -> "Drums").
+  const instrumentOf = (section) =>
+    /drum/i.test(section) ? 'Drums' : (/bass/i.test(section) ? 'DoubleBass' : 'Single');
+  const activeInstrument = instrumentOf(targetChartSection);
+
+  // Auto practice sections for [Events]: MIDI markers, else audio novelty
+  // (bands retained from auto-sync), else an 8-measure grid.
+  useEffect(() => {
+    if (!parsedMidi || chartEvents.length === 0) { setPracticeSections([]); return; }
+    const playable = chartEvents.filter(e => e.type === 'N' && (e.value <= 4 || e.value === 7));
+    if (playable.length === 0) { setPracticeSections([]); return; }
+    setPracticeSections(generatePracticeSections({
+      parsedMidi,
+      leadInTicks: Math.round(drumSyncOffset * getEffectiveBPM() * 8),
+      sourcePPQ: parsedMidi.header.ppq || 480,
+      bands: bandsRef.current ? bandsRef.current.bands : null,
+      fps: bandsRef.current ? bandsRef.current.fps : 0,
+      bpmEvents: autoSync ? autoSync.bpmEvents : null,
+      fallbackBPM: getEffectiveBPM(),
+      measureTicks: getMeasureTicks(),
+      firstNoteTick: Math.min(...playable.map(e => e.tick)),
+      lastNoteTick: Math.max(...playable.map(e => e.tick))
+    }));
+  }, [parsedMidi, chartEvents, autoSync, drumSyncOffset, actualBPM]);
 
   // Convert current time to tick (Ticks = Seconds * BPM * 8 at 480 PPQ)
   const timeToTick = (timeSecs) => {
@@ -899,14 +951,55 @@ export default function App() {
 
   // Generate standard chart file output string
   // Thin wrappers over the shared chartGen module (same logic the CLI uses).
-  const generateChartString = () => buildChartString({
+  // Assembles every locked instrument plus the active one; each instrument
+  // gets all four difficulties derived from its Expert events (unless the
+  // expert-only escape hatch is checked).
+  const buildNoteSections = () => {
+    const measureTicks = getMeasureTicks();
+    const instruments = [
+      ...lockedInstruments.filter(li => li.instrument !== activeInstrument),
+      { instrument: activeInstrument, events: chartEvents }
+    ].filter(li => li.events.length > 0);
+
+    const sections = [];
+    for (const { instrument, events } of instruments) {
+      let expert = events;
+      if (instrument !== 'Drums' && hopoMode === 'strum-downbeats') {
+        expert = computeForcedFlags(expert, { mode: 'strum-downbeats', measureTicks });
+      }
+      if (exportAllDifficulties) {
+        const all = buildAllDifficulties(expert, {
+          isDrums: instrument === 'Drums', isBass: instrument === 'DoubleBass', measureTicks
+        });
+        for (const [difficulty, events2] of Object.entries(all)) {
+          sections.push({ section: `${difficulty}${instrument}`, events: events2 });
+        }
+      } else {
+        sections.push({ section: `Expert${instrument}`, events: expert });
+      }
+    }
+    return sections;
+  };
+
+  const exportedInstruments = () => {
+    const set = new Set(lockedInstruments.map(li => li.instrument));
+    if (chartEvents.length > 0) set.add(activeInstrument);
+    return set;
+  };
+
+  const generateChartString = (musicStream = 'song.ogg') => buildChartString({
     parsedMidi,
-    chartEvents,
-    targetSection: targetChartSection,
     effectiveBPM: getEffectiveBPM(),
     midiBPM: getMidiBPM(),
     drumSyncOffset,
-    autoSync
+    autoSync,
+    songMeta: {
+      name: iniTitle, artist: iniArtist, charter: iniCharter,
+      album: iniAlbum, genre: iniGenre || 'Custom', year: iniYear,
+      musicStream
+    },
+    sectionEvents: practiceSections,
+    noteSections: buildNoteSections()
   });
 
   const generateSongIni = (musicStream = 'song.ogg') => {
@@ -915,7 +1008,14 @@ export default function App() {
     const songLengthMs = audioBufferRef.current
       ? Math.round(audioBufferRef.current.duration * 1000)
       : (parsedMidi ? Math.round((parsedMidi.duration * (getMidiBPM() / getEffectiveBPM()) + drumSyncOffset) * 1000) : 180000);
-    return buildSongIni({ title: iniTitle, artist: iniArtist, charter: iniCharter, musicStream, songLengthMs });
+    const present = exportedInstruments();
+    return buildSongIni({
+      title: iniTitle, artist: iniArtist, charter: iniCharter, musicStream, songLengthMs,
+      album: iniAlbum || 'Custom Single', genre: iniGenre || 'Custom', year: iniYear || 2026,
+      diffGuitar: present.has('Single') ? 3 : -1,
+      diffBass: present.has('DoubleBass') ? 3 : -1,
+      diffDrums: present.has('Drums') ? 3 : -1
+    });
   };
 
   // Bundle Export handler creating zip folders with standard song.ogg
@@ -928,15 +1028,11 @@ export default function App() {
     try {
       const zip = new JSZip();
 
-      // 1. notes.chart — Clone Hero only scans for "notes.chart" / "notes.mid".
-      // Do NOT also ship the raw source MIDI as notes.mid: it is a GM drum file,
-      // not a CH-format chart, and CH would try to load it instead of the .chart.
-      const chartContent = generateChartString();
-      zip.file('notes.chart', chartContent);
-
-      // 2. Audio stem. Prefer the backend's real Ogg; otherwise encode the
-      // decoded + 2s-padded preview buffer to WAV client-side. NEVER ship raw
-      // MP3 bytes under an .ogg name — Clone Hero hangs trying to decode that.
+      // 1. Audio stem — decided FIRST so notes.chart's MusicStream and
+      // song.ini's music_stream both name the file actually shipped. Prefer the
+      // backend's real Ogg; otherwise encode the decoded + 2s-padded preview
+      // buffer to WAV client-side. NEVER ship raw MP3 bytes under an .ogg name
+      // — Clone Hero hangs trying to decode that.
       let musicStream = 'song.ogg';
       if (transcodedAudioBlob) {
         zip.file('song.ogg', transcodedAudioBlob);
@@ -957,6 +1053,11 @@ export default function App() {
       } else {
         alert('Warning: no audio was uploaded, so the bundle contains no audio stem. Clone Hero will list the song but cannot play it.');
       }
+
+      // 2. notes.chart — Clone Hero only scans for "notes.chart" / "notes.mid".
+      // Do NOT also ship the raw source MIDI as notes.mid: it is a GM drum file,
+      // not a CH-format chart, and CH would try to load it instead of the .chart.
+      zip.file('notes.chart', generateChartString(musicStream));
 
       // 3. song.ini (music_stream must name the stem actually written above)
       const iniContent = generateSongIni(musicStream);
@@ -1132,23 +1233,48 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">Target .Chart Track Section</label>
-                <select 
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">Target Instrument</label>
+                <select
                   value={targetChartSection}
                   onChange={(e) => setTargetChartSection(e.target.value)}
                   disabled={!parsedMidi}
                   className="w-full bg-slate-950 border border-slate-850 text-slate-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-indigo-500 transition"
                 >
-                  <option value="ExpertDrums">Expert Drums</option>
-                  <option value="HardDrums">Hard Drums</option>
-                  <option value="MediumDrums">Medium Drums</option>
-                  <option value="EasyDrums">Easy Drums</option>
-                  <option value="ExpertSingle">Expert Single (Guitar)</option>
-                  <option value="HardSingle">Hard Single (Guitar)</option>
-                  <option value="MediumSingle">Medium Single (Guitar)</option>
-                  <option value="EasySingle">Easy Single (Guitar)</option>
-                  <option value="ExpertDoubleBass">Expert Double Bass</option>
+                  <option value="ExpertDrums">Drums</option>
+                  <option value="ExpertSingle">Guitar (Single)</option>
+                  <option value="ExpertDoubleBass">Bass (DoubleBass)</option>
                 </select>
+                <div className="flex items-center justify-between text-xs mt-2">
+                  <label htmlFor="chk-all-diffs" className="text-slate-300 cursor-pointer">
+                    Auto-generate all 4 difficulties
+                  </label>
+                  <input
+                    id="chk-all-diffs"
+                    type="checkbox"
+                    checked={exportAllDifficulties}
+                    onChange={(e) => setExportAllDifficulties(e.target.checked)}
+                    className="rounded border-slate-850 bg-slate-950 text-indigo-500 focus:ring-indigo-500 w-4 h-4 cursor-pointer"
+                  />
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  You chart at Expert; Hard/Medium/Easy are derived automatically using
+                  reduction rules measured from professional charts (coarser note grids,
+                  fewer chords, fewer lanes, longer sustains). Uncheck to export Expert only.
+                </p>
+                {targetChartSection !== 'ExpertDrums' && (
+                  <div className="flex items-center justify-between text-xs mt-2">
+                    <label htmlFor="chk-hopo" className="text-slate-300 cursor-pointer">
+                      Force strums on downbeat HOPOs
+                    </label>
+                    <input
+                      id="chk-hopo"
+                      type="checkbox"
+                      checked={hopoMode === 'strum-downbeats'}
+                      onChange={(e) => setHopoMode(e.target.checked ? 'strum-downbeats' : 'natural')}
+                      className="rounded border-slate-850 bg-slate-950 text-indigo-500 focus:ring-indigo-500 w-4 h-4 cursor-pointer"
+                    />
+                  </div>
+                )}
               </div>
 
               {/* Actual BPM / Tempo correction input box */}
@@ -1349,13 +1475,91 @@ export default function App() {
               </div>
               <div className="flex flex-col gap-1">
                 <label className="text-slate-400">Charter / Mapper Name</label>
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   value={iniCharter}
                   onChange={(e) => setIniCharter(e.target.value)}
                   placeholder="Charter"
                   className="bg-slate-950 border border-slate-855 rounded px-2 py-1.5 text-slate-200 text-xs focus:outline-none focus:border-indigo-500"
                 />
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <div className="flex flex-col gap-1 col-span-1">
+                  <label className="text-slate-400">Album</label>
+                  <input
+                    type="text"
+                    value={iniAlbum}
+                    onChange={(e) => setIniAlbum(e.target.value)}
+                    placeholder="Album"
+                    className="bg-slate-950 border border-slate-855 rounded px-2 py-1.5 text-slate-200 text-xs focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div className="flex flex-col gap-1 col-span-1">
+                  <label className="text-slate-400">Genre</label>
+                  <input
+                    type="text"
+                    value={iniGenre}
+                    onChange={(e) => setIniGenre(e.target.value)}
+                    placeholder="Genre"
+                    className="bg-slate-950 border border-slate-855 rounded px-2 py-1.5 text-slate-200 text-xs focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div className="flex flex-col gap-1 col-span-1">
+                  <label className="text-slate-400">Year</label>
+                  <input
+                    type="number"
+                    value={iniYear}
+                    onChange={(e) => setIniYear(e.target.value)}
+                    placeholder="2026"
+                    className="bg-slate-950 border border-slate-855 rounded px-2 py-1.5 text-slate-200 text-xs focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Multi-instrument chart assembly */}
+            <div className="border-t border-slate-850 pt-3 flex flex-col gap-2 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-slate-300">Instruments in this chart</span>
+                <button
+                  onClick={() => {
+                    if (chartEvents.length === 0) return;
+                    setLockedInstruments(prev => [
+                      ...prev.filter(li => li.instrument !== activeInstrument),
+                      { instrument: activeInstrument, events: chartEvents.map(e => ({ ...e })) }
+                    ]);
+                  }}
+                  disabled={!parsedMidi || chartEvents.length === 0}
+                  className="px-2 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded text-[11px] font-semibold transition"
+                >
+                  Lock in {activeInstrument === 'Single' ? 'Guitar' : activeInstrument === 'DoubleBass' ? 'Bass' : 'Drums'}
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-400 -mt-1">
+                Lock the current instrument, then switch Target Instrument + Source MIDI Track and map another —
+                all locked instruments export into ONE notes.chart (like professional charts).
+              </p>
+              {[...lockedInstruments.map(li => li.instrument), ...(chartEvents.length > 0 && !lockedInstruments.some(li => li.instrument === activeInstrument) ? [activeInstrument] : [])].map(inst => (
+                <div key={inst} className="flex items-center justify-between bg-slate-950/60 border border-slate-800 rounded px-2 py-1">
+                  <span className="text-slate-300">
+                    {inst === 'Single' ? 'Guitar' : inst === 'DoubleBass' ? 'Bass' : 'Drums'}
+                    {inst === activeInstrument && <span className="text-indigo-400"> (editing)</span>}
+                    {exportAllDifficulties ? ' — 4 difficulties' : ' — Expert only'}
+                  </span>
+                  {lockedInstruments.some(li => li.instrument === inst) && (
+                    <button
+                      onClick={() => setLockedInstruments(prev => prev.filter(li => li.instrument !== inst))}
+                      className="text-red-400 hover:text-red-300 text-[11px] font-semibold"
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="text-[11px] text-slate-400">
+                {practiceSections.length > 0
+                  ? `${practiceSections.length} practice section${practiceSections.length === 1 ? '' : 's'} will be written to [Events]: ${practiceSections.slice(0, 4).map(s => s.name).join(', ')}${practiceSections.length > 4 ? ', …' : ''}`
+                  : 'No practice sections yet — run Auto-Sync (audio novelty) or use a MIDI with markers.'}
               </div>
             </div>
 

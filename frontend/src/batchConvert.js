@@ -7,7 +7,12 @@
 
 import { Midi } from '@tonejs/midi';
 import { computeOnsetEnvelope, fitTempoMap, anchorsToBpmEvents, fitWeightForPitch, fitBandForPitch } from './tempoAnalysis.js';
-import { presetMappingForPitch, isDrumsSection, compileChartEvents, generateChartString, generateSongIni } from './chartGen.js';
+import {
+  presetMappingForPitch, compileChartEvents, generateChartString, generateSongIni,
+  parseSectionName, measureTicksFromTS
+} from './chartGen.js';
+import { buildAllDifficulties } from './difficultyReduction.js';
+import { generatePracticeSections } from './sections.js';
 import { padAudioBuffer, audioBufferToWav } from './audioUtil.js';
 
 export const MIDI_EXTS = ['mid', 'midi'];
@@ -86,7 +91,10 @@ const writeFile = async (dirHandle, name, data) => {
 // Build one song folder under outDirHandle. midiFile/audioFile are File objects.
 export const buildSongToDirectory = async ({
   midiFile, audioFile, artist, song, charter = 'n3rdy13',
-  section = 'ExpertDrums', density = 8, autoStarPower = false, outDirHandle, audioCtx, onStage = () => {}
+  section = 'ExpertDrums', density = 8, autoStarPower = false,
+  allDifficulties = true, practiceSections = true,
+  album = 'Custom Single', genre = 'Custom', year = 2026,
+  outDirHandle, audioCtx, onStage = () => {}
 }) => {
   if (!artist || !song) throw new Error('artist and song are required');
 
@@ -99,7 +107,10 @@ export const buildSongToDirectory = async ({
   const trk = midi.tracks[trackIndex];
   if (!trk || !trk.notes.length) throw new Error('MIDI has no notes');
 
-  const isDrums = isDrumsSection(section);
+  // Normalize the legacy section prop to an instrument.
+  const { instrument: rawInst } = parseSectionName(section);
+  const instrument = /drum/i.test(rawInst) ? 'Drums' : (/bass/i.test(rawInst) ? 'DoubleBass' : 'Single');
+  const isDrums = instrument === 'Drums';
   const pitchMappings = {};
   new Set(trk.notes.map((n) => n.midi)).forEach((p) => { pitchMappings[p] = presetMappingForPitch(p, isDrums); });
 
@@ -107,7 +118,7 @@ export const buildSongToDirectory = async ({
   const decoded = await audioCtx.decodeAudioData(await audioFile.arrayBuffer());
   const padded = padAudioBuffer(audioCtx, decoded, 2.0);
 
-  let effectiveBPM = midiBPM, drumSyncOffset = 2.0, autoSync = null;
+  let effectiveBPM = midiBPM, drumSyncOffset = 2.0, autoSync = null, bands = null, fps = 0;
   if (trk.notes.length >= 12) {
     onStage('syncing');
     const mono = new Float32Array(padded.length);
@@ -115,7 +126,7 @@ export const buildSongToDirectory = async ({
       const d = padded.getChannelData(c);
       for (let i = 0; i < d.length; i++) mono[i] += d[i] / padded.numberOfChannels;
     }
-    const { bands, fps } = await computeOnsetEnvelope(mono, padded.sampleRate);
+    ({ bands, fps } = await computeOnsetEnvelope(mono, padded.sampleRate));
     const ppq = midi.header.ppq || 480;
     const hits = trk.notes.map((n) => ({ beat: n.ticks / ppq, w: fitWeightForPitch(n.midi), band: fitBandForPitch(n.midi) }));
     const fit = await fitTempoMap(bands, fps, hits, midiBPM);
@@ -129,13 +140,47 @@ export const buildSongToDirectory = async ({
   onStage('charting');
   const chartEvents = compileChartEvents({
     parsedMidi: midi, trackIndex, pitchMappings, drumSyncOffset,
-    effectiveBPM, targetSection: section, autoStarPower, spDensityMeasures: density
+    effectiveBPM, targetSection: `Expert${instrument}`, autoStarPower, spDensityMeasures: density
   });
+
+  const ts = (midi.header.timeSignatures && midi.header.timeSignatures.length > 0)
+    ? midi.header.timeSignatures[0].timeSignature : [4, 4];
+  const measureTicks = measureTicksFromTS(ts);
+
+  const noteSections = [];
+  if (allDifficulties) {
+    const all = buildAllDifficulties(chartEvents, { isDrums, isBass: instrument === 'DoubleBass', measureTicks });
+    for (const [difficulty, events] of Object.entries(all)) {
+      noteSections.push({ section: `${difficulty}${instrument}`, events });
+    }
+  } else {
+    noteSections.push({ section: `Expert${instrument}`, events: chartEvents });
+  }
+
+  let sectionEvents = [];
+  if (practiceSections) {
+    const playable = chartEvents.filter((e) => e.type === 'N' && (e.value <= 4 || e.value === 7));
+    sectionEvents = generatePracticeSections({
+      parsedMidi: midi, leadInTicks: Math.round(drumSyncOffset * effectiveBPM * 8),
+      sourcePPQ: midi.header.ppq || 480,
+      bands, fps, bpmEvents: autoSync ? autoSync.bpmEvents : null, fallbackBPM: effectiveBPM,
+      measureTicks,
+      firstNoteTick: playable.length ? Math.min(...playable.map((e) => e.tick)) : 0,
+      lastNoteTick: playable.length ? Math.max(...playable.map((e) => e.tick)) : 0
+    });
+  }
+
   const chartString = generateChartString({
-    parsedMidi: midi, chartEvents, targetSection: section, effectiveBPM, midiBPM, drumSyncOffset, autoSync
+    parsedMidi: midi, effectiveBPM, midiBPM, drumSyncOffset, autoSync,
+    songMeta: { name: song, artist, charter, album, genre, year, musicStream: 'song.wav' },
+    sectionEvents, noteSections
   });
   const iniString = generateSongIni({
-    title: song, artist, charter, musicStream: 'song.wav', songLengthMs: Math.round(padded.duration * 1000)
+    title: song, artist, charter, musicStream: 'song.wav', songLengthMs: Math.round(padded.duration * 1000),
+    album, genre, year,
+    diffGuitar: instrument === 'Single' ? 3 : -1,
+    diffBass: instrument === 'DoubleBass' ? 3 : -1,
+    diffDrums: instrument === 'Drums' ? 3 : -1
   });
 
   onStage('encoding');

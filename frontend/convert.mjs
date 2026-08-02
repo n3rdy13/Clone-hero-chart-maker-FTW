@@ -10,7 +10,14 @@
 //   node convert.mjs --midi song.mid --mp3 song.mp3 --artist "Deftones" --song "Around the Fur" --charter n3rdy13
 //   node convert.mjs "song.mid" "song.mp3"        (then it prompts for text)
 //   node convert.mjs                              (fully interactive)
-// Optional: --section ExpertDrums  --density 8  --track <index>  --out "<dir>"
+// Optional flags:
+//   --album "X" --genre "X" --year 1998           song metadata (chart + ini)
+//   --guitar-track N --bass-track N --drums-track N   multi-instrument chart
+//   --section ExpertDrums --track N               legacy single-instrument pick
+//   --expert-only                                 skip Hard/Medium/Easy generation
+//   --no-sections                                 skip [Events] practice sections
+//   --hopo-mode strum-downbeats                   force strums on downbeat HOPOs
+//   --starpower --density 8 --out "<dir>"
 
 import fs from 'fs';
 import path from 'path';
@@ -19,7 +26,12 @@ import { spawnSync } from 'child_process';
 import pkg from '@tonejs/midi';
 const { Midi } = pkg;
 import { computeOnsetEnvelope, fitTempoMap, anchorsToBpmEvents, fitWeightForPitch, fitBandForPitch } from './src/tempoAnalysis.js';
-import { presetMappingForPitch, isDrumsSection, compileChartEvents, generateChartString, generateSongIni } from './src/chartGen.js';
+import {
+  presetMappingForPitch, isDrumsSection, compileChartEvents, generateChartString,
+  generateSongIni, parseSectionName, measureTicksFromTS
+} from './src/chartGen.js';
+import { buildAllDifficulties, computeForcedFlags } from './src/difficultyReduction.js';
+import { generatePracticeSections } from './src/sections.js';
 
 const DEFAULT_OUT = 'C:\\Users\\test\\Documents\\Clone Hero\\Songs';
 const SR = 44100;
@@ -40,15 +52,17 @@ const resolveFfmpeg = () => {
 
 // --- arg parsing ------------------------------------------------------------
 const parseArgs = (argv) => {
-  const opts = { section: 'ExpertDrums', density: 8, out: DEFAULT_OUT };
+  const opts = { density: 8, out: DEFAULT_OUT };
   const positionals = [];
+  const boolFlags = ['starpower', 'expert-only', 'no-sections'];
+  const intFlags = ['density', 'track', 'year', 'guitar-track', 'bass-track', 'drums-track'];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const key = a.slice(2);
-      if (key === 'starpower') { opts.starpower = true; continue; } // boolean flag (default off)
+      if (boolFlags.includes(key)) { opts[key] = true; continue; }
       const val = argv[i + 1]; i++;
-      if (key === 'density' || key === 'track') opts[key] = parseInt(val);
+      if (intFlags.includes(key)) opts[key] = parseInt(val);
       else opts[key] = val;
     } else positionals.push(a);
   }
@@ -66,6 +80,73 @@ const prompt = (rl, q, def) => new Promise(res => {
 });
 
 const sanitize = (s) => s.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim();
+
+// --- instrument assignment --------------------------------------------------
+
+// A GM drum transcription lives on channel 9 or keeps ~all pitches in the GM
+// percussion range (35-59).
+const looksLikeDrums = (trk) => {
+  if (trk.channel === 9) return true;
+  if (!trk.notes.length) return false;
+  const inRange = trk.notes.filter(n => n.midi >= 35 && n.midi <= 59).length;
+  return inRange / trk.notes.length > 0.9;
+};
+
+// Decide which MIDI tracks become which chart instruments.
+// Priority: explicit --guitar-track/--bass-track/--drums-track flags, then the
+// legacy --section/--track pair, then name/channel auto-detection.
+const resolveInstrumentAssignments = (midi, opts) => {
+  const flagMap = { 'guitar-track': 'Single', 'bass-track': 'DoubleBass', 'drums-track': 'Drums' };
+  const explicit = Object.entries(flagMap)
+    .filter(([flag]) => Number.isInteger(opts[flag]))
+    .map(([flag, instrument]) => ({ instrument, trackIndex: opts[flag] }));
+  if (explicit.length > 0) {
+    for (const a of explicit) {
+      const t = midi.tracks[a.trackIndex];
+      if (!t || !t.notes.length) throw new Error(`--${a.instrument} track ${a.trackIndex} has no notes.`);
+    }
+    return explicit;
+  }
+
+  const densest = () => {
+    let idx = 0, max = -1;
+    midi.tracks.forEach((t, i) => { if (t.notes.length > max) { max = t.notes.length; idx = i; } });
+    return idx;
+  };
+
+  if (opts.section || Number.isInteger(opts.track)) {
+    const { instrument } = parseSectionName(opts.section || 'ExpertDrums');
+    const trackIndex = Number.isInteger(opts.track) ? opts.track : densest();
+    const t = midi.tracks[trackIndex];
+    if (!t || !t.notes.length) throw new Error('Selected MIDI track has no notes.');
+    // Normalize legacy names (e.g. ExpertDoubleBass -> DoubleBass; anything
+    // drum-ish -> Drums; everything else -> Single).
+    const inst = /drum/i.test(instrument) ? 'Drums' : (/bass/i.test(instrument) ? 'DoubleBass' : 'Single');
+    return [{ instrument: inst, trackIndex }];
+  }
+
+  // Auto-detect: name regex first, channel/pitch profile as backup; keep the
+  // densest candidate per instrument.
+  const byInstrument = {};
+  midi.tracks.forEach((t, i) => {
+    if (!t.notes.length) return;
+    const name = t.name || '';
+    let inst = null;
+    if (/drum|perc/i.test(name) || looksLikeDrums(t)) inst = 'Drums';
+    else if (/bass/i.test(name)) inst = 'DoubleBass';
+    else if (/guitar|lead|gtr/i.test(name)) inst = 'Single';
+    if (!inst) return;
+    if (!byInstrument[inst] || midi.tracks[byInstrument[inst]].notes.length < t.notes.length) byInstrument[inst] = i;
+  });
+  const detected = Object.entries(byInstrument).map(([instrument, trackIndex]) => ({ instrument, trackIndex }));
+  if (detected.length > 0) return detected;
+
+  // Nothing recognizable by name: densest track, drums if it profiles like a
+  // GM drum transcription (this tool's historical primary input), else guitar.
+  const trackIndex = densest();
+  if (!midi.tracks[trackIndex] || !midi.tracks[trackIndex].notes.length) throw new Error('MIDI has no notes.');
+  return [{ instrument: looksLikeDrums(midi.tracks[trackIndex]) ? 'Drums' : 'Single', trackIndex }];
+};
 
 // --- audio via ffmpeg -------------------------------------------------------
 const decodeMonoPCM = (ffmpeg, input) => {
@@ -117,30 +198,29 @@ const main = async () => {
   const midi = new Midi(fs.readFileSync(opts.midi));
   const midiBPM = (midi.header.tempos && midi.header.tempos.length) ? midi.header.tempos[0].bpm : 120;
 
-  // Track: explicit --track, else the one with the most notes (app default).
-  let trackIndex = Number.isInteger(opts.track) ? opts.track : 0;
-  if (!Number.isInteger(opts.track)) {
-    let max = -1;
-    midi.tracks.forEach((t, i) => { if (t.notes.length > max) { max = t.notes.length; trackIndex = i; } });
+  // Instrument assignments: explicit per-instrument flags, else the legacy
+  // --section/--track pair, else auto-detect from track names/channels.
+  const assignments = resolveInstrumentAssignments(midi, opts);
+  for (const a of assignments) {
+    const t = midi.tracks[a.trackIndex];
+    console.log(`      ${a.instrument.padEnd(10)} <- track [${a.trackIndex}] "${t.name || 'Unnamed'}" — ${t.notes.length} notes`);
   }
-  const track = midi.tracks[trackIndex];
-  if (!track || !track.notes.length) throw new Error('Selected MIDI track has no notes.');
-  console.log(`      track [${trackIndex}] "${track.name || 'Unnamed'}" — ${track.notes.length} notes, MIDI tempo ${midiBPM.toFixed(2)} BPM`);
+  console.log(`      MIDI tempo ${midiBPM.toFixed(2)} BPM`);
 
-  // Preset pitch mappings.
-  const isDrums = isDrumsSection(opts.section);
-  const pitchMappings = {};
-  new Set(track.notes.map(n => n.midi)).forEach(p => { pitchMappings[p] = presetMappingForPitch(p, isDrums); });
+  // Tempo fit anchors to the drum track when present (best onsets), else the
+  // densest assigned track.
+  const fitAssignment = assignments.find(a => a.instrument === 'Drums') || assignments[0];
+  const track = midi.tracks[fitAssignment.trackIndex];
 
   // Auto-sync tempo map against the audio (mirrors the app's runAutoTempoSync).
   console.log(`[2/5] Decoding audio + fitting tempo map (this can take ~10-30s)…`);
-  let effectiveBPM = midiBPM, drumSyncOffset = 2.0, autoSync = null;
+  let effectiveBPM = midiBPM, drumSyncOffset = 2.0, autoSync = null, bands = null, fps = 0;
   if (track.notes.length >= 12) {
     const rawMono = decodeMonoPCM(ffmpeg, opts.mp3);
     const padSamples = Math.round(2.0 * SR);
     const mono = new Float32Array(padSamples + rawMono.length);
     mono.set(rawMono, padSamples); // 2s silence lead-in, matching the exported Ogg
-    const { bands, fps } = await computeOnsetEnvelope(mono, SR);
+    ({ bands, fps } = await computeOnsetEnvelope(mono, SR));
     const ppq = midi.header.ppq || 480;
     const hits = track.notes.map(n => ({ beat: n.ticks / ppq, w: fitWeightForPitch(n.midi), band: fitBandForPitch(n.midi) }));
     const fit = await fitTempoMap(bands, fps, hits, midiBPM);
@@ -154,18 +234,71 @@ const main = async () => {
     console.log(`      too few notes to fit — using MIDI tempo ${midiBPM.toFixed(2)} with a 2.0s lead-in`);
   }
 
-  // Compile chart. Star power is opt-in via --starpower (off by default).
+  // Compile + reduce every assigned instrument. Star power is opt-in via
+  // --starpower; when on, phrases are generated at Expert and mirrored down.
   console.log(`[3/5] Compiling chart events${opts.starpower ? ' + star power' : ''}…`);
-  const chartEvents = compileChartEvents({
-    parsedMidi: midi, trackIndex, pitchMappings, drumSyncOffset,
-    effectiveBPM, targetSection: opts.section, autoStarPower: !!opts.starpower, spDensityMeasures: opts.density
-  });
-  const noteCount = chartEvents.filter(e => e.type === 'N' && ![66, 67, 68].includes(e.value)).length;
-  const spCount = chartEvents.filter(e => e.type === 'S').length;
-  console.log(`      ${noteCount} notes, ${spCount} star power phrase(s)`);
+  const ts = (midi.header.timeSignatures && midi.header.timeSignatures.length > 0)
+    ? midi.header.timeSignatures[0].timeSignature : [4, 4];
+  const measureTicks = measureTicksFromTS(ts);
+
+  const noteSections = [];
+  let allExpertEvents = [];
+  const diffs = { Single: -1, DoubleBass: -1, Drums: -1 };
+  for (const a of assignments) {
+    const trk = midi.tracks[a.trackIndex];
+    const isDrums = a.instrument === 'Drums';
+    const pitchMappings = {};
+    new Set(trk.notes.map(n => n.midi)).forEach(p => { pitchMappings[p] = presetMappingForPitch(p, isDrums); });
+
+    let expertEvents = compileChartEvents({
+      parsedMidi: midi, trackIndex: a.trackIndex, pitchMappings, drumSyncOffset,
+      effectiveBPM, targetSection: `Expert${a.instrument}`,
+      autoStarPower: !!opts.starpower, spDensityMeasures: opts.density
+    });
+    if (!isDrums && opts['hopo-mode'] === 'strum-downbeats') {
+      expertEvents = computeForcedFlags(expertEvents, { mode: 'strum-downbeats', measureTicks });
+    }
+    allExpertEvents = allExpertEvents.concat(expertEvents);
+    diffs[a.instrument] = 3;
+
+    if (opts['expert-only']) {
+      noteSections.push({ section: `Expert${a.instrument}`, events: expertEvents });
+    } else {
+      const all = buildAllDifficulties(expertEvents, {
+        isDrums, isBass: a.instrument === 'DoubleBass', measureTicks
+      });
+      for (const [difficulty, events] of Object.entries(all)) {
+        noteSections.push({ section: `${difficulty}${a.instrument}`, events });
+      }
+    }
+    const noteCount = expertEvents.filter(e => e.type === 'N' && ![66, 67, 68].includes(e.value)).length;
+    const spCount = expertEvents.filter(e => e.type === 'S').length;
+    console.log(`      ${a.instrument}: ${noteCount} expert notes, ${spCount} star power phrase(s)${opts['expert-only'] ? '' : ', 4 difficulties'}`);
+  }
+
+  // Practice sections for [Events]: MIDI markers -> audio novelty -> 8-measure grid.
+  let sectionEvents = [];
+  if (!opts['no-sections']) {
+    const playable = allExpertEvents.filter(e => e.type === 'N' && (e.value <= 4 || e.value === 7));
+    const firstNoteTick = playable.length ? Math.min(...playable.map(e => e.tick)) : 0;
+    const lastNoteTick = playable.length ? Math.max(...playable.map(e => e.tick)) : 0;
+    sectionEvents = generatePracticeSections({
+      parsedMidi: midi, leadInTicks: Math.round(drumSyncOffset * effectiveBPM * 8),
+      sourcePPQ: midi.header.ppq || 480,
+      bands, fps, bpmEvents: autoSync ? autoSync.bpmEvents : null, fallbackBPM: effectiveBPM,
+      measureTicks, firstNoteTick, lastNoteTick
+    });
+    console.log(`      ${sectionEvents.length} practice section(s)`);
+  }
 
   const chartString = generateChartString({
-    parsedMidi: midi, chartEvents, targetSection: opts.section, effectiveBPM, midiBPM, drumSyncOffset, autoSync
+    parsedMidi: midi, effectiveBPM, midiBPM, drumSyncOffset, autoSync,
+    songMeta: {
+      name: opts.song, artist: opts.artist, charter: opts.charter,
+      album: opts.album || '', genre: opts.genre || 'Custom', year: opts.year || '',
+      musicStream: 'song.ogg'
+    },
+    sectionEvents, noteSections
   });
 
   // Output folder.
@@ -189,7 +322,9 @@ const main = async () => {
 
   fs.writeFileSync(path.join(destDir, 'notes.chart'), chartString);
   fs.writeFileSync(path.join(destDir, 'song.ini'), generateSongIni({
-    title: opts.song, artist: opts.artist, charter: opts.charter, musicStream: 'song.ogg', songLengthMs
+    title: opts.song, artist: opts.artist, charter: opts.charter, musicStream: 'song.ogg', songLengthMs,
+    album: opts.album || 'Custom Single', genre: opts.genre || 'Custom', year: opts.year || 2026,
+    diffGuitar: diffs.Single, diffBass: diffs.DoubleBass, diffDrums: diffs.Drums
   }));
 
   console.log(`\n✅ Done → ${destDir}`);

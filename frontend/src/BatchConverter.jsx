@@ -133,13 +133,12 @@ export default function BatchConverter({ defaultSection = 'ExpertDrums' }) {
           {/* Global options */}
           <div className="grid grid-cols-3 gap-3 mb-4 text-xs">
             <div className="flex flex-col gap-1">
-              <label className="text-slate-400">Target Section</label>
+              <label className="text-slate-400">Instrument (all 4 difficulties)</label>
               <select value={section} onChange={e => setSection(e.target.value)} disabled={building}
                 className="bg-slate-950 border border-slate-800 text-slate-200 rounded px-2 py-1.5 focus:outline-none focus:border-fuchsia-500">
-                <option value="ExpertDrums">Expert Drums</option>
-                <option value="HardDrums">Hard Drums</option>
-                <option value="ExpertSingle">Expert Guitar</option>
-                <option value="HardSingle">Hard Guitar</option>
+                <option value="ExpertDrums">Drums</option>
+                <option value="ExpertSingle">Guitar</option>
+                <option value="ExpertDoubleBass">Bass</option>
               </select>
             </div>
             <div className="flex flex-col gap-1">

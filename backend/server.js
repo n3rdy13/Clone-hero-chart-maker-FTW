@@ -5,8 +5,9 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
 
-// Direct path setup using escaped Windows backslashes
-const ffmpegPath = 'C:\\Users\\test\\Downloads\\ffmpeg-8.1-full_build-shared\\ffmpeg-8.1-full_build-shared\\bin\\ffmpeg.exe';
+// FFMPEG_PATH env var wins; otherwise rely on ffmpeg being on PATH (same
+// resolution order as convert.mjs).
+const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
