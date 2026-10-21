@@ -9,6 +9,7 @@ import { onsetStrength } from './dsp/onset.js';
 import { estimateTempoCurve } from './dsp/tempo.js';
 import { trackBeats } from './dsp/beats.js';
 import { melSpectrogram, separateDrums } from './drums/transcribe.js';
+import { drumFeatures } from './drums/toms.js';
 import { ComplexFFT } from './dsp/fft.js';
 
 export const ANALYSIS_SR = 22050;
@@ -63,14 +64,16 @@ export class SongAnalyzer {
   }
 
   // Drum activations (kick, snare, cymbal, high) of the best drum audio we
-  // have: the stem when it matches the song, otherwise the full mix.
+  // have: the stem when it matches the song, otherwise the full mix. Plus the
+  // band energies and low-rate audio Detect mode uses to find toms.
   transcribe() {
     if (this.acts) return this.acts;
     const fromStem = this.useStem;
     const samples = fromStem ? this.stem : this.mix;
     const spec = melSpectrogram(samples, this.sr);
     const acts = separateDrums(spec, { fullMix: !fromStem });
-    this.acts = { acts, fps: spec.fps, shift: fromStem ? this.stemInfo.shift : 0, source: fromStem ? 'stem' : 'mix' };
+    const features = drumFeatures(samples, this.sr, spec);
+    this.acts = { acts, features, fps: spec.fps, shift: fromStem ? this.stemInfo.shift : 0, source: fromStem ? 'stem' : 'mix' };
     return this.acts;
   }
 }

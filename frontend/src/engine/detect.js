@@ -2,14 +2,20 @@
 // written as a part (General MIDI pitches on grid beats, offset 0) so the rest
 // of the chart pipeline treats them like a tab.
 import { pickHits } from './drums/transcribe.js';
+import { classifyHits } from './drums/toms.js';
 import { timeToBeat, snapBeat } from './drums/quantize.js';
 
-export const DETECT_GM = { kick: 36, snare: 38, hat: 42, crash: 49 };
-export const DETECT_NAMES = { 36: 'Kick (detected)', 38: 'Snare (detected)', 42: 'Hi-hat (detected)', 49: 'Crash (detected)' };
+// Toms use GM pitches whose default mapping is the matching pad: 48 yellow,
+// 45 blue, 41 green.
+export const DETECT_GM = { kick: 36, snare: 38, hat: 42, crash: 49, highTom: 48, midTom: 45, floorTom: 41 };
+export const DETECT_NAMES = {
+  36: 'Kick (detected)', 38: 'Snare (detected)', 42: 'Hi-hat (detected)', 49: 'Crash (detected)',
+  48: 'High tom (detected)', 45: 'Mid tom (detected)', 41: 'Floor tom (detected)',
+};
 
 // acts: SongAnalyzer.transcribe() result. gridTimes: chart-time grid.
 export function detectedPart(acts, gridTimes, pad, { sensitivity = 0.5, division = 4 } = {}) {
-  const hits = pickHits(acts.acts, acts.fps, { sensitivity });
+  const hits = classifyHits(pickHits(acts.acts, acts.fps, { sensitivity }), acts.features, { stem: acts.source === 'stem', sensitivity });
   const last = gridTimes.length - 1;
   const seen = new Set();
   const notes = [];

@@ -61,9 +61,21 @@ The two beats MusicMastering squeezes in before the first real beat are skipped.
 
 ### Detect mode
 
-Without a tab, the app can transcribe kick, snare, hi-hat and crash from the audio (best from a drum
-stem), snapped to the beat grid. Weak "snares" sitting on a kick are dropped: they're kick leakage.
-Toms and ride aren't detected, so treat it as a draft.
+Without a tab, the app can transcribe kick, snare, toms, hi-hat and crash from the audio (best from a
+drum stem), snapped to the beat grid. Weak "snares" sitting on a kick are dropped: they're kick leakage.
+
+- **Toms.** A "snare" with no wire buzz at the attack (3–9 kHz against 80–400 Hz) that keeps ringing
+  is a tom. The song's toms are grouped by body pitch: highest on yellow, middle on blue, lowest on
+  green. A tom-like hit at the pitch of the song's snare is the snare with its wires off, and stays red.
+  Toms are timed from their own attack (the snare template peaks late on a ringing tom).
+- **Drum stem only:** a "kick" that rings much longer than the song's kicks, with no more beater click,
+  is a floor tom, and a tom attack with no kick or snare on it is added. On a full mix bass notes look
+  the same, so there only snare hits are checked.
+- **Ghost cymbals.** A hi-hat or crash with no attack above 6 kHz is dropped: that's the cymbal
+  template firing on crash wash or a snare tail. A quiet closed hi-hat right after a loud crash can be
+  dropped too.
+
+Ride isn't detected (it comes out as hi-hat or crash), so treat it as a draft.
 
 ### What it measured on the sample songs
 
@@ -157,7 +169,7 @@ written straight into your Songs folder.
 
 | Path | What |
 |---|---|
-| `frontend/src/engine/` | Analysis: onset envelopes, tempo curve, beat tracker, tempo map, stem matching, tab reading and alignment, drum transcription, kick check. Plain JS, runs in a Web Worker and in Node. |
+| `frontend/src/engine/` | Analysis: onset envelopes, tempo curve, beat tracker, tempo map, stem matching, tab reading and alignment, drum transcription (`drums/toms.js`: toms and ghost cymbals), kick check. Plain JS, runs in a Web Worker and in Node. |
 | `frontend/src/chartGen.js` | Notes → `.chart` / `song.ini`: lanes, cymbal flags, time signatures, star power, tempo events. |
 | `frontend/src/songBuilder.js` | One-call pipeline used by the CLI, the batch converter and the tests. |
 | `frontend/src/engine/dawTempo.js`, `frontend/src/dawImport.js` | DAW tempo maps (`.mid`, `.rpp`, `.dawproject`) → beat times, and the check against the detected beats. |
@@ -172,6 +184,6 @@ written straight into your Songs folder.
 - Expert only. Make the lower difficulties in Moonscraper.
 - The tab must follow the recording's structure. A different intro, or an extra repeat the recording
   lacks, misplaces the notes after that point. Use the nudge buttons, or edit the tab.
-- Cymbal type and toms are only as good as the tab. Nothing in the audio check changes them.
+- With a tab, cymbal type and toms are only as good as the tab. Nothing in the audio check changes them.
 - Without a drum stem, beats come from the full mix. Check by ear, and use ÷2 / ×2 if the tempo reads
   half or double.

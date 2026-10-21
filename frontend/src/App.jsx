@@ -1636,7 +1636,7 @@ export default function App() {
               {drumSource === 'detect' && (
                 <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-3 flex flex-col gap-3 text-xs">
                   <p className="text-[11px] text-slate-400">
-                    Finds kick, snare, hi-hat and crash {analysis.acts?.source === 'stem' ? 'in the drum stem' : 'in the song (a drum stem gives much cleaner results)'}, snapped to the beat grid. A draft to edit: toms and ride aren&apos;t detected.
+                    Finds kick, snare, toms, hi-hat and crash {analysis.acts?.source === 'stem' ? 'in the drum stem' : 'in the song (a drum stem gives much cleaner results, and is needed for floor toms)'}, snapped to the beat grid. Toms go on yellow, blue and green, highest to lowest. A draft to edit: ride isn&apos;t detected.
                   </p>
                   <label className="flex items-center justify-between gap-2 text-slate-400">
                     Sensitivity
