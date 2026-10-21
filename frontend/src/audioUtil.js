@@ -60,3 +60,73 @@ export const audioBufferToWav = (buffer) => {
   }
   return new Blob([view], { type: 'audio/wav' });
 };
+
+// Decodes any format the browser supports (mp3, m4a/aac, ogg, opus, wav, flac)
+// and returns the full-quality AudioBuffer for playback plus a mono copy
+// resampled to `sr` for analysis.
+export async function decodeForAnalysis(file, sr = 22050) {
+  const data = await file.arrayBuffer();
+  let buffer;
+  try {
+    buffer = await new OfflineAudioContext(1, 1, 44100).decodeAudioData(data);
+  } catch {
+    throw new Error(`Couldn't decode "${file.name}". Try MP3, M4A, OGG, WAV or FLAC.`);
+  }
+  const length = Math.max(1, Math.ceil(buffer.duration * sr));
+  const ctx = new OfflineAudioContext(1, length, sr);
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(ctx.destination);
+  src.start();
+  const rendered = await ctx.startRendering();
+  return { buffer, samples: rendered.getChannelData(0).slice() };
+}
+
+// Simple synthetic kit for previewing chart notes against the recording
+// (after drumcharts2026's Player.drum). lane: kick | red | yellow | blue | green.
+const noiseByCtx = new WeakMap();
+export function playDrumSound(ctx, when, lane, cymbal) {
+  const out = ctx.createGain();
+  out.connect(ctx.destination);
+  if (lane === 'kick') {
+    const osc = ctx.createOscillator();
+    osc.frequency.setValueAtTime(140, when);
+    osc.frequency.exponentialRampToValueAtTime(45, when + 0.12);
+    out.gain.setValueAtTime(0.9, when);
+    out.gain.exponentialRampToValueAtTime(0.0001, when + 0.25);
+    osc.connect(out);
+    osc.start(when);
+    osc.stop(when + 0.26);
+    return;
+  }
+  if (lane !== 'red' && !cymbal) {
+    const osc = ctx.createOscillator();
+    const pitch = { yellow: 220, blue: 165, green: 110 }[lane] ?? 165;
+    osc.frequency.setValueAtTime(pitch * 1.4, when);
+    osc.frequency.exponentialRampToValueAtTime(pitch, when + 0.08);
+    out.gain.setValueAtTime(0.6, when);
+    out.gain.exponentialRampToValueAtTime(0.0001, when + 0.3);
+    osc.connect(out);
+    osc.start(when);
+    osc.stop(when + 0.31);
+    return;
+  }
+  let noise = noiseByCtx.get(ctx);
+  if (!noise) {
+    noise = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+    const d = noise.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    noiseByCtx.set(ctx, noise);
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = noise;
+  const filter = ctx.createBiquadFilter();
+  filter.type = lane === 'red' ? 'bandpass' : 'highpass';
+  filter.frequency.value = lane === 'red' ? 1800 : 7000;
+  const decay = lane === 'red' ? 0.15 : lane === 'yellow' ? 0.06 : 0.6;
+  out.gain.setValueAtTime(lane === 'red' ? 0.8 : 0.35, when);
+  out.gain.exponentialRampToValueAtTime(0.0001, when + decay);
+  src.connect(filter).connect(out);
+  src.start(when);
+  src.stop(when + decay + 0.01);
+}

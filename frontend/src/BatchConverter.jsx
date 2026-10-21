@@ -3,7 +3,7 @@ import { FolderInput, FolderOutput, Layers, Play, CheckCircle, AlertCircle, Refr
 import { MIDI_EXTS, AUDIO_EXTS, extOf, pairFiles, buildSongToDirectory } from './batchConvert';
 
 const STAGE_LABEL = {
-  parsing: 'Parsing MIDI…', decoding: 'Decoding audio…', syncing: 'Fitting tempo…',
+  parsing: 'Parsing MIDI…', decoding: 'Decoding audio…', syncing: 'Finding beats…', drums: 'Checking drums…',
   charting: 'Building chart…', encoding: 'Encoding WAV…', writing: 'Writing files…'
 };
 
@@ -18,6 +18,7 @@ export default function BatchConverter({ defaultSection = 'ExpertDrums' }) {
   const [section, setSection] = useState(defaultSection);
   const [density, setDensity] = useState(8);
   const [charter, setCharter] = useState('n3rdy13');
+  const [dropKicks, setDropKicks] = useState(false);
   const [building, setBuilding] = useState(false);
   const [summary, setSummary] = useState(null);
 
@@ -40,6 +41,8 @@ export default function BatchConverter({ defaultSection = 'ExpertDrums' }) {
         midiHandle: p.midi.handle,
         audioName: p.audio ? p.audio.name : null,
         audioHandle: p.audio ? p.audio.handle : null,
+        stemName: p.stem ? p.stem.name : null,
+        stemHandle: p.stem ? p.stem.handle : null,
         artist: p.artist,
         song: p.song,
         status: p.audio ? 'ready' : 'no-audio',
@@ -76,12 +79,14 @@ export default function BatchConverter({ defaultSection = 'ExpertDrums' }) {
         try {
           const midiFile = await row.midiHandle.getFile();
           const audioFile = await row.audioHandle.getFile();
+          const stemFile = row.stemHandle ? await row.stemHandle.getFile() : null;
           const res = await buildSongToDirectory({
-            midiFile, audioFile, artist: row.artist, song: row.song, charter,
-            section, density, outDirHandle: outHandleRef.current, audioCtx: ctx,
+            midiFile, audioFile, stemFile, artist: row.artist, song: row.song, charter,
+            section, density, autoStarPower: true, dropFlaggedKicks: dropKicks, outDirHandle: outHandleRef.current, audioCtx: ctx,
             onStage: (s) => updateRow(row.id, { message: STAGE_LABEL[s] || s })
           });
-          updateRow(row.id, { status: 'done', message: `${res.notes} notes · ${res.starPower} SP · ${res.bpm.toFixed(1)} BPM` });
+          const kicks = res.flaggedKicks ? ` · ${res.flaggedKicks} kicks ${res.removedKicks ? 'removed' : 'flagged'}` : '';
+          updateRow(row.id, { status: 'done', message: `${res.notes} notes · ${res.starPower} SP · ${res.bpm.toFixed(1)} BPM${kicks}` });
           ok++;
         } catch (err) {
           updateRow(row.id, { status: 'error', message: err.message });
@@ -104,8 +109,9 @@ export default function BatchConverter({ defaultSection = 'ExpertDrums' }) {
         Batch Folder Converter
       </h2>
       <p className="text-[11px] text-slate-400 mt-2 mb-4">
-        Point at a folder of MIDI + audio files; each pair is auto-synced, charted (with star power),
-        and written straight into your Clone Hero Songs folder as a ready song — no unzip, no moving.
+        Point at a folder of MIDI + audio files; each song's beats are mapped, the tab is placed on them,
+        charted (with star power) and written straight into your Clone Hero Songs folder — no unzip, no moving.
+        An audio file with &quot;drums&quot; in its name is used as that song&apos;s drum stem (better beats and the kick check).
         Audio is written as <span className="font-mono text-fuchsia-300">song.wav</span> (larger but always loads).
       </p>
 
@@ -131,7 +137,7 @@ export default function BatchConverter({ defaultSection = 'ExpertDrums' }) {
           </div>
 
           {/* Global options */}
-          <div className="grid grid-cols-3 gap-3 mb-4 text-xs">
+          <div className="grid grid-cols-4 gap-3 mb-4 text-xs">
             <div className="flex flex-col gap-1">
               <label className="text-slate-400">Target Section</label>
               <select value={section} onChange={e => setSection(e.target.value)} disabled={building}
@@ -156,6 +162,14 @@ export default function BatchConverter({ defaultSection = 'ExpertDrums' }) {
               <input value={charter} onChange={e => setCharter(e.target.value)} disabled={building}
                 className="bg-slate-950 border border-slate-800 text-slate-200 rounded px-2 py-1.5 focus:outline-none focus:border-fuchsia-500" />
             </div>
+            <label className="flex flex-col gap-1 text-slate-400" title="Needs a drum stem: removes tab kicks with no kick in the stem">
+              Unsupported kicks
+              <select value={dropKicks ? 'drop' : 'keep'} onChange={e => setDropKicks(e.target.value === 'drop')} disabled={building}
+                className="bg-slate-950 border border-slate-800 text-slate-200 rounded px-2 py-1.5 focus:outline-none focus:border-fuchsia-500">
+                <option value="keep">Keep (report)</option>
+                <option value="drop">Remove</option>
+              </select>
+            </label>
           </div>
 
           {/* Detected songs table */}
@@ -183,8 +197,9 @@ export default function BatchConverter({ defaultSection = 'ExpertDrums' }) {
                         <input value={r.song} disabled={building} onChange={e => updateRow(r.id, { song: e.target.value })}
                           className="w-full bg-slate-900 border border-slate-800 rounded px-1.5 py-1 text-slate-200 focus:outline-none focus:border-fuchsia-500" />
                       </td>
-                      <td className="p-2 text-slate-400 truncate max-w-[140px]" title={r.audioName || ''}>
+                      <td className="p-2 text-slate-400 truncate max-w-[160px]" title={[r.audioName, r.stemName].filter(Boolean).join(' + ')}>
                         {r.audioName || <span className="text-amber-400">— none —</span>}
+                        {r.stemName && <span className="block text-sky-400 truncate">+ stem: {r.stemName}</span>}
                       </td>
                       <td className="p-2">
                         {r.status === 'ready' && <span className="text-slate-500">ready</span>}

@@ -10,7 +10,8 @@
     "install-all": "npm install",
     "start-backend": "npm start --prefix backend",
     "build-frontend": "npm run build --prefix frontend",
-    "start-frontend": "npm run dev --prefix frontend"
+    "start-frontend": "npm run dev --prefix frontend",
+    "test": "npm test --prefix frontend"
   },
   "dependencies": {
     "ffmpeg": "^0.0.4",
