@@ -13,6 +13,7 @@
 //   node convert.mjs                                 (fully interactive)
 // Options:
 //   --stem <file>              drum stem split from the same song (better beats + kick check)
+//   --daw <file>               tempo map from the DAW session (.mid, .rpp or .dawproject) instead of detecting beats
 //   --detect                   chart detected drums instead of a MIDI tab
 //   --drop-unsupported-kicks   remove tab kicks the drum stem doesn't back up (default: just report them)
 //   --offset <beats>           place the tab by hand (grid beat of tab beat 0)
@@ -28,6 +29,8 @@ const { Midi } = pkg;
 import { SongAnalyzer, ANALYSIS_SR, DEFAULT_TRACKING } from './src/engine/analyze.js';
 import { buildChart } from './src/songBuilder.js';
 import { LEAD_IN_SECONDS, generateSongIni, barStartBeats, isFlagValue } from './src/chartGen.js';
+import { readDawTempo } from './src/dawImport.js';
+import { compareWithDetected, dawShiftToApply } from './src/engine/dawTempo.js';
 
 const DEFAULT_OUT = 'C:\\Users\\test\\Documents\\Clone Hero\\Songs';
 
@@ -61,11 +64,13 @@ const parseArgs = (argv) => {
       else opts[key] = val;
     } else positionals.push(a);
   }
-  // Sort loose file args by extension: MIDI, then song audio, then a stem.
+  // Sort loose file args by extension: MIDI, then song audio, then a stem;
+  // a Reaper or DAWproject file is the DAW tempo map.
   for (const p of positionals) {
     const ext = path.extname(p).toLowerCase();
     if (['.mid', '.midi'].includes(ext) && !opts.midi) opts.midi = p;
-    else if (['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.opus', '.aac'].includes(ext)) {
+    else if (['.rpp', '.dawproject'].includes(ext) && !opts.daw) opts.daw = p;
+    else if (['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.opus', '.aac', '.wma', '.aiff', '.aif', '.webm'].includes(ext)) {
       if (!opts.audio) opts.audio = p;
       else if (!opts.stem) opts.stem = p;
     }
@@ -125,7 +130,8 @@ const main = async () => {
 
   // Strip accidental surrounding quotes from drag-dropped paths.
   const clean = p => p && p.replace(/^"(.*)"$/, '$1');
-  opts.midi = clean(opts.midi); opts.audio = clean(opts.audio); opts.stem = clean(opts.stem) || null;
+  opts.midi = clean(opts.midi); opts.audio = clean(opts.audio); opts.stem = clean(opts.stem) || null; opts.daw = clean(opts.daw) || null;
+  if (opts.daw && !fs.existsSync(opts.daw)) throw new Error('DAW tempo file not found: ' + opts.daw);
 
   if (!detect && !fs.existsSync(opts.midi)) throw new Error('MIDI not found: ' + opts.midi);
   if (!fs.existsSync(opts.audio)) throw new Error('Audio not found: ' + opts.audio);
@@ -149,6 +155,17 @@ const main = async () => {
   const { beats } = analyzer.track(DEFAULT_TRACKING);
   console.log(`      ${beats.length} beats from the ${summary.beatSource === 'stem' ? 'drum stem' : 'song'}; detecting drums…`);
   const acts = analyzer.transcribe();
+  let dawBeats = null;
+  if (opts.daw) {
+    const daw = await readDawTempo(path.basename(opts.daw), new Uint8Array(fs.readFileSync(opts.daw)));
+    console.log(`      DAW ${daw.label}`);
+    if (daw.warning) console.log(`      WARNING: ${daw.warning}`);
+    const cmp = compareWithDetected(daw.beats, beats);
+    const shift = dawShiftToApply(cmp);
+    console.log(`      DAW beats vs detected: ${Math.round(cmp.agreement * 100)}% agree within 20 ms, offset ${(cmp.shift * 1000).toFixed(1)} ms${shift ? ` (applied)` : ''}`);
+    if (cmp.agreement < 0.5) console.log('      WARNING: the DAW map does not line up with this audio. Is it from the same song and version?');
+    dawBeats = daw.beats.map(b => b + shift);
+  }
 
   console.log(`[3/5] Building chart…`);
   const built = buildChart({
@@ -158,10 +175,10 @@ const main = async () => {
     offset: Number.isInteger(opts.offset) ? opts.offset : null,
     meta: { name: opts.song, artist: opts.artist, charter: opts.charter },
     musicStream: 'song.ogg', autoStarPower: Boolean(opts.starpower), spEveryBars: opts.density,
-    dropFlaggedKicks: Boolean(opts['drop-unsupported-kicks'])
+    dropFlaggedKicks: Boolean(opts['drop-unsupported-kicks']), dawBeats
   });
   const bpms = built.map.events.filter(e => !e.leadIn).map(e => e.bpm);
-  console.log(`      tempo map: ${bpms.length} tempo events, ${Math.min(...bpms).toFixed(1)}–${Math.max(...bpms).toFixed(1)} BPM`);
+  console.log(`      tempo map (${dawBeats ? 'from the DAW file' : 'detected, one tempo per beat'}): ${bpms.length} tempo events, ${Math.min(...bpms).toFixed(1)}–${Math.max(...bpms).toFixed(1)} BPM`);
   if (!detect) {
     const start = built.map.gridTimes[Math.max(0, Math.min(built.map.gridTimes.length - 1, built.offset))] - LEAD_IN_SECONDS;
     const alts = built.align?.alternatives?.length ? ` (close calls: ${built.align.alternatives.map(a => `${a.offset - built.offset > 0 ? '+' : ''}${a.offset - built.offset}${a.outside ? ` (cuts ${a.outside} notes)` : ''}`).join(', ')} beats — use --offset to override)` : '';

@@ -18,7 +18,15 @@ import {
   VolumeX,
   Zap,
   Drum,
-  ShieldCheck
+  ShieldCheck,
+  Copy,
+  Scissors,
+  ClipboardPaste,
+  Undo2,
+  Redo2,
+  BoxSelect,
+  AudioWaveform,
+  Clock
 } from 'lucide-react';
 import { Midi } from '@tonejs/midi';
 import JSZip from 'jszip';
@@ -38,8 +46,13 @@ import {
   generateChartString as buildChartString,
   generateSongIni as buildSongIni,
   isFlagValue,
-  drumMappingId
+  drumMappingId,
+  makeSecondsToTick
 } from './chartGen';
+import { KICK_FLAG_BELOW } from './engine/align';
+import { compareWithDetected, dawShiftToApply } from './engine/dawTempo';
+import { readDawTempo } from './dawImport';
+import { allPadIds, idsInTickRange, copyNotes, deleteNotes, pasteNotes, moveNotes, setLane, isPad } from './editOps';
 import { gridFromBeats, alignmentEvidence, alignPart, kickCheckFor } from './songBuilder';
 import { partBeatToSeconds } from './engine/part';
 import { decodeForAnalysis, padAudioBuffer, audioBufferToWav, playDrumSound } from './audioUtil';
@@ -47,7 +60,30 @@ import { parseSongName, stripExt } from './batchConvert';
 import BatchConverter from './BatchConverter';
 
 const PAD = LEAD_IN_SECONDS;
-const AUDIO_ACCEPT = '.mp3,.m4a,.aac,.ogg,.opus,.wav,.flac';
+const AUDIO_ACCEPT = '.mp3,.m4a,.aac,.ogg,.opus,.wav,.flac,.wma,.aiff,.aif,.webm';
+const DAW_ACCEPT = '.mid,.midi,.rpp,.dawproject';
+const CANVAS_W = 300;
+const CANVAS_H = 560;
+const PLAYHEAD_FROM_BOTTOM = 120;
+const WAVE_BIN = 0.002; // seconds per waveform peak
+
+// Peak envelope (max |sample| per WAVE_BIN) for drawing the waveform, scaled
+// so the loud parts of the song reach the edges of the highway.
+function computePeaks(samples, sr) {
+  const per = Math.max(1, Math.round(WAVE_BIN * sr));
+  const n = Math.ceil(samples.length / per);
+  const peaks = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let m = 0;
+    const end = Math.min(samples.length, (i + 1) * per);
+    for (let j = i * per; j < end; j++) { const v = Math.abs(samples[j]); if (v > m) m = v; }
+    peaks[i] = m;
+  }
+  const sorted = Array.from(peaks).filter(v => v > 0).sort((a, b) => a - b);
+  const ref = sorted.length ? sorted[Math.floor(sorted.length * 0.995)] : 1;
+  for (let i = 0; i < n; i++) peaks[i] = Math.min(1, peaks[i] / (ref || 1));
+  return peaks;
+}
 
 // General MIDI Drum Pitches Map
 const GM_DRUM_MAP = {
@@ -143,7 +179,9 @@ export default function App() {
   const analysisTokenRef = useRef(0);
   const [analysis, setAnalysis] = useState({ status: 'idle', message: '', summary: null, beats: [], onset: null, acts: null });
   const [tracking, setTracking] = useState(DEFAULT_TRACKING);
-  const [toleranceMs, setToleranceMs] = useState(20);
+  const [toleranceMs, setToleranceMs] = useState(0); // 0 = one tempo per beat ("meticulous")
+  const [dawTempo, setDawTempo] = useState(null); // tempo map read from a DAW session file
+  const [tempoSource, setTempoSource] = useState('detected'); // detected | daw
 
   // --- Chart source & mapping ----------------------------------------------
   const [selectedTrackIndex, setSelectedTrackIndex] = useState(0);
@@ -161,14 +199,31 @@ export default function App() {
   const [pitchSearchQuery, setPitchSearchQuery] = useState('');
 
   const [chartEvents, setChartEvents] = useState([]);
-  const [compileStats, setCompileStats] = useState(null);
+  // Hand edits: once the chart is edited, settings changes don't silently
+  // overwrite it; a Rebuild button appears instead.
+  const [edited, setEdited] = useState(false);
+  const editedRef = useRef(false);
+  const [rebuildPending, setRebuildPending] = useState(false);
+  const historyRef = useRef({ undo: [], redo: [] });
+  const [historySize, setHistorySize] = useState({ undo: 0, redo: 0 });
+  const clipboardRef = useRef(null);
+  const [clipCount, setClipCount] = useState(0);
 
   // --- Preview / transport --------------------------------------------------
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [scrollSpeed, setScrollSpeed] = useState(350);
   const [enableNoteSFX, setEnableNoteSFX] = useState(true);
-  const [selectedNote, setSelectedNote] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const selectionAnchorRef = useRef(null);
+  const [marquee, setMarquee] = useState(null); // { x0, y0, x1, y1 } while dragging
+  const dragRef = useRef(null);
+  const [pasteSnap, setPasteSnap] = useState('120'); // ticks, or 'bar'
+  const [rangeFrom, setRangeFrom] = useState('');
+  const [rangeTo, setRangeTo] = useState('');
+  const [waveSource, setWaveSource] = useState('auto'); // auto | stem | song | off
+  const wavesRef = useRef({ song: null, stem: null });
+  const [wavesVersion, setWavesVersion] = useState(0);
 
   const audioContextRef = useRef(null);
   const audioBufferRef = useRef(null);
@@ -201,9 +256,24 @@ export default function App() {
 
   // --- File handlers --------------------------------------------------------
 
+  const resetEdits = () => {
+    editedRef.current = false;
+    setEdited(false);
+    setRebuildPending(false);
+    historyRef.current = { undo: [], redo: [] };
+    setHistorySize({ undo: 0, redo: 0 });
+    setSelectedIds([]);
+  };
+
   const handleMidiUpload = async (file) => {
     try {
       const midi = new Midi(await file.arrayBuffer());
+      // A MIDI with no notes but lots of tempo changes is a DAW tempo map.
+      if (!midi.tracks.some(t => t.notes.length) && (midi.header.tempos?.length || 0) > 4) {
+        await handleDawUpload(file);
+        return;
+      }
+      resetEdits();
       setParsedMidi(midi);
       setMidiMetadata(readMeta(file, {
         ppq: midi.header.ppq,
@@ -251,7 +321,26 @@ export default function App() {
     }
   };
 
+  const handleDawUpload = async (file) => {
+    try {
+      const r = await readDawTempo(file.name, new Uint8Array(await file.arrayBuffer()));
+      setDawTempo(r);
+      setTempoSource(r.warning ? 'detected' : 'daw');
+      setManualOffset(null);
+      if (r.warning) alert(r.warning);
+    } catch (e) {
+      alert(e.message);
+    }
+  };
+
+  const clearDaw = () => {
+    setDawTempo(null);
+    setTempoSource('detected');
+    setManualOffset(null);
+  };
+
   const handleAudioUpload = async (file) => {
+    resetEdits();
     setAudioFile(file);
     setAudioMetadata(readMeta(file, { duration: 'Decoding…' }));
     setManualOffset(null);
@@ -268,6 +357,8 @@ export default function App() {
     }
     const { buffer, samples, serverOgg } = decoded;
     mixSamplesRef.current = samples;
+    wavesRef.current = { ...wavesRef.current, song: computePeaks(samples, ANALYSIS_SR) };
+    setWavesVersion(v => v + 1);
     // The exported song.ogg starts with PAD seconds of silence; the preview
     // plays the same padded audio so it matches the chart exactly.
     audioBufferRef.current = serverOgg ? buffer : padAudioBuffer(ctx, buffer, PAD);
@@ -287,6 +378,8 @@ export default function App() {
     try {
       const { buffer, samples, serverOgg } = await decodeWithFallback(file, setStemMetadata);
       stemSamplesRef.current = samples;
+      wavesRef.current = { ...wavesRef.current, stem: computePeaks(samples, ANALYSIS_SR) };
+      setWavesVersion(v => v + 1);
       setStemMetadata(prev => ({ ...prev, duration: (serverOgg ? buffer.duration - PAD : buffer.duration).toFixed(1) + 's' }));
       setManualOffset(null);
       setAudioVersion(v => v + 1);
@@ -298,6 +391,8 @@ export default function App() {
 
   const clearStem = () => {
     stemSamplesRef.current = null;
+    wavesRef.current = { ...wavesRef.current, stem: null };
+    setWavesVersion(v => v + 1);
     setStemMetadata(null);
     setManualOffset(null);
     setAudioVersion(v => v + 1);
@@ -375,20 +470,34 @@ export default function App() {
     try { return midiToPart(parsedMidi, selectedTrackIndex); } catch (e) { console.error(e); return null; }
   }, [parsedMidi, selectedTrackIndex]);
 
-  // Beat grid (chart time = song time + PAD). Without audio, the MIDI's own
-  // tempo is used so a MIDI-only chart can still be previewed and exported.
+  // DAW tempo map: checked against the detected beats; a clear constant offset
+  // (decoder padding, a re-export) is corrected.
+  const dawCompare = useMemo(() => (dawTempo && analysis.beats.length >= 8 ? compareWithDetected(dawTempo.beats, analysis.beats) : null), [dawTempo, analysis.beats]);
+  const dawShift = dawCompare ? dawShiftToApply(dawCompare) : 0;
+  const dawBeats = useMemo(() => {
+    if (!dawTempo) return null;
+    const end = songDuration > 0 ? songDuration + 1 : Infinity;
+    return dawTempo.beats.map(b => b + dawShift).filter(b => b <= end);
+  }, [dawTempo, dawShift, songDuration]);
+  const usingDaw = tempoSource === 'daw' && dawBeats && dawBeats.length >= 4;
+
+  // Beat grid (chart time = song time + PAD): the DAW map, or the beats found
+  // in the recording (smoothed, one tempo per beat by default). Without audio,
+  // the MIDI's own tempo is used so a MIDI-only chart can still be previewed.
   const tempoMap = useMemo(() => {
+    if (usingDaw) return gridFromBeats(dawBeats, songDuration || dawBeats[dawBeats.length - 1], { toleranceMs, smooth: 0 });
     if (analysis.beats.length >= 2) return gridFromBeats(analysis.beats, songDuration, { toleranceMs });
     if (midiPart && !audioFile) {
       const beats = [];
       for (let b = 0; b <= Math.ceil(midiPart.endBeat) + 8; b++) beats.push(partBeatToSeconds(midiPart, b));
-      return gridFromBeats(beats, beats[beats.length - 1], { toleranceMs: 1 });
+      return gridFromBeats(beats, beats[beats.length - 1], { toleranceMs: 1, smooth: 0 });
     }
     return null;
-  }, [analysis.beats, songDuration, toleranceMs, midiPart, audioFile]);
+  }, [usingDaw, dawBeats, analysis.beats, songDuration, toleranceMs, midiPart, audioFile]);
   const lastBeat = tempoMap ? tempoMap.gridTimes.length - 1 : 0;
   const tempos = useMemo(() => (tempoMap ? chartTempos(tempoMap) : [{ tick: 0, milli: 120000 }]), [tempoMap]);
   const tickToSec = useMemo(() => makeTickToSeconds(tempos), [tempos]);
+  const secToTick = useMemo(() => makeSecondsToTick(tempos), [tempos]);
 
   // The part being charted: the tab, or drums detected in the audio.
   const part = useMemo(() => {
@@ -428,17 +537,22 @@ export default function App() {
 
   const kickCheck = useMemo(() => (isDrumsMode ? kickCheckFor(analysis.acts, PAD) : null), [analysis.acts, isDrumsMode]);
 
-  // Compile chart events (manual edits apply on top until inputs change).
-  useEffect(() => {
-    if (!part || !tempoMap) { setChartEvents([]); setCompileStats(null); return; }
-    const { events, stats } = compileChartEvents({
+  // Compile chart events from the current settings.
+  const compiled = useMemo(() => {
+    if (!part || !tempoMap) return { events: [], stats: null };
+    return compileChartEvents({
       part, offset, pitchMappings, targetSection: targetChartSection, gridTimes: tempoMap.gridTimes,
       kickCheck, dropFlaggedKicks, autoStarPower, spEveryBars: spDensityMeasures, timeSigs
     });
-    setChartEvents(events);
-    setCompileStats(stats);
-    setSelectedNote(null);
   }, [part, offset, pitchMappings, targetChartSection, tempoMap, kickCheck, dropFlaggedKicks, autoStarPower, spDensityMeasures, timeSigs]);
+  const compileStats = compiled.stats;
+
+  // Follow the settings until the chart is edited by hand; after that, offer a rebuild.
+  useEffect(() => {
+    if (editedRef.current) { setRebuildPending(true); return; }
+    setChartEvents(compiled.events);
+    setSelectedIds([]);
+  }, [compiled]);
 
   // --- Tempo / alignment helpers -------------------------------------------
 
@@ -623,6 +737,34 @@ export default function App() {
 
   // --- Fretboard canvas ----------------------------------------------------
 
+  const playheadY = CANVAS_H - PLAYHEAD_FROM_BOTTOM;
+  const laneWidth = CANVAS_W / 5;
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const cymbalPads = useMemo(() => new Set(chartEvents.filter(e => isFlagValue(e.value)).map(e => e.pairId)), [chartEvents]);
+  const selectedNote = selectedIds.length === 1 ? chartEvents.find(e => e.id === selectedIds[0]) || null : null;
+
+  // Screen position of a pad: { x, y, kick } (kick notes are full-width bars).
+  const notePos = (evt) => {
+    const y = playheadY - (tickToSec(evt.tick) - currentTime) * scrollSpeed;
+    let lane = evt.value;
+    if (lane > 4) lane = evt.value === 32 ? 0 : 4;
+    return { x: lane * laneWidth + laneWidth / 2, y, kick: isDrumsMode && lane === 0 };
+  };
+
+  // Waveform shown behind the highway: the drum stem when there is one.
+  const waveform = useMemo(() => {
+    const w = wavesRef.current;
+    const pick = waveSource === 'auto' ? (w.stem ? 'stem' : 'song') : waveSource;
+    if (pick === 'off') return null;
+    if (pick === 'stem' && w.stem) {
+      const st = analysis.summary?.stem;
+      return { peaks: w.stem, shift: st && st.match >= 0.15 ? st.shift : 0 };
+    }
+    return w.song ? { peaks: w.song, shift: 0 } : null;
+    // wavesVersion tells us when the peaks in the ref changed
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waveSource, wavesVersion, analysis.summary]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -633,18 +775,33 @@ export default function App() {
     ctx.fillStyle = '#020617';
     ctx.fillRect(0, 0, width, height);
 
-    const laneCount = 5;
-    const laneWidth = width / laneCount;
-    for (let i = 0; i <= laneCount; i++) {
-      ctx.strokeStyle = i === 0 || i === laneCount ? '#475569' : '#1e293b';
-      ctx.lineWidth = i === 0 || i === laneCount ? 3 : 1;
+    // Waveform: one row per pixel, the loudest peak in that slice of time.
+    if (waveform) {
+      const { peaks, shift } = waveform;
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.22)';
+      const half = width / 2 - 4;
+      for (let y = 0; y < height; y++) {
+        const tHi = currentTime + (playheadY - y) / scrollSpeed - PAD - shift;
+        const tLo = currentTime + (playheadY - y - 1) / scrollSpeed - PAD - shift;
+        let i0 = Math.floor(tLo / WAVE_BIN);
+        const i1 = Math.floor(tHi / WAVE_BIN);
+        if (i1 < 0 || i0 >= peaks.length) continue;
+        i0 = Math.max(0, i0);
+        let a = 0;
+        for (let i = i0; i <= Math.min(peaks.length - 1, i1); i++) if (peaks[i] > a) a = peaks[i];
+        if (a > 0.01) ctx.fillRect(width / 2 - a * half, y, 2 * a * half, 1);
+      }
+    }
+
+    for (let i = 0; i <= 5; i++) {
+      ctx.strokeStyle = i === 0 || i === 5 ? '#475569' : '#1e293b';
+      ctx.lineWidth = i === 0 || i === 5 ? 3 : 1;
       ctx.beginPath();
       ctx.moveTo(i * laneWidth, 0);
       ctx.lineTo(i * laneWidth, height);
       ctx.stroke();
     }
 
-    const playheadY = height - 100;
     ctx.fillStyle = 'rgba(239, 68, 68, 0.25)';
     ctx.fillRect(0, playheadY - 10, width, 20);
     ctx.strokeStyle = '#ef4444';
@@ -659,13 +816,14 @@ export default function App() {
     // Beat and bar lines from the real tempo map.
     if (tempoMap) {
       const g = tempoMap.gridTimes;
-      const barSet = new Set(bars.map(b => Math.round(b * 1000)));
+      const barIndex = new Map(bars.map((b, i) => [Math.round(b * 1000), i]));
       ctx.textAlign = 'left';
       ctx.textBaseline = 'alphabetic';
       for (let b = 0; b < g.length; b++) {
         const y = yOf(g[b]);
         if (y < -10 || y > height + 10) continue;
-        const isBar = barSet.has(b * 1000);
+        const bi = barIndex.get(b * 1000);
+        const isBar = bi !== undefined;
         ctx.strokeStyle = isBar ? '#64748b' : '#334155';
         ctx.lineWidth = isBar ? 2 : 1;
         ctx.beginPath();
@@ -675,17 +833,17 @@ export default function App() {
         if (isBar) {
           ctx.fillStyle = '#94a3b8';
           ctx.font = '10px sans-serif';
-          ctx.fillText(`Bar ${bars.findIndex(x => Math.round(x * 1000) === b * 1000) + 1}`, 5, y - 4);
+          ctx.fillText(`Bar ${bi + 1}`, 5, y - 4);
         }
       }
     }
 
-    const getNoteStyles = (noteValue, mappedType) => {
+    const getNoteStyles = (noteValue, cymbal) => {
       if (isDrumsMode) {
         if (noteValue === 0) return { fill: '#ffffff', stroke: '#94a3b8', radius: 10, label: 'K' };
         if (noteValue === 32) return { fill: '#818cf8', stroke: '#4f46e5', radius: 10, label: '2K' };
         if (noteValue === 1) return { fill: '#ef4444', stroke: '#b91c1c', radius: 12, label: 'R' };
-        if (mappedType && mappedType.includes('cymbal')) {
+        if (cymbal) {
           if (noteValue === 2) return { fill: '#facc15', stroke: '#ca8a04', radius: 11, shape: 'diamond', label: 'YC' };
           if (noteValue === 3) return { fill: '#3b82f6', stroke: '#1d4ed8', radius: 11, shape: 'diamond', label: 'BC' };
           if (noteValue === 4) return { fill: '#22c55e', stroke: '#15803d', radius: 11, shape: 'diamond', label: 'GC' };
@@ -708,14 +866,15 @@ export default function App() {
     const spRegions = chartEvents.filter(evt => evt.type === 'S').map(evt => [evt.tick, evt.tick + evt.duration]);
     const inStarPower = (t) => spRegions.some(([start, end]) => t >= start && t <= end);
 
-    chartEvents.forEach(evt => {
-      if (isFlagValue(evt.value) || evt.type === 'S') return;
-      const y = yOf(tickToSec(evt.tick));
-      if (y < -50 || y > height + 50) return;
-      let laneIndex = evt.value;
-      if (laneIndex > 4) laneIndex = evt.value === 32 ? 0 : 4;
+    // Kicks first so pads draw on top of them.
+    const pads = chartEvents.filter(isPad);
+    pads.sort((a, b) => Number(!(a.value === 0 || a.value === 32)) - Number(!(b.value === 0 || b.value === 32)));
+    for (const evt of pads) {
+      const { x, y, kick } = notePos(evt);
+      if (y < -50 || y > height + 50) continue;
+      const selected = selectedSet.has(evt.id);
 
-      if (laneIndex === 0 && isDrumsMode) {
+      if (kick) {
         ctx.setLineDash(evt.flagged ? [6, 4] : []);
         ctx.strokeStyle = evt.flagged ? '#fb923c' : (inStarPower(evt.tick) ? '#c084fc' : (evt.value === 32 ? '#818cf8' : '#ffffff'));
         ctx.lineWidth = 8;
@@ -729,19 +888,17 @@ export default function App() {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(evt.flagged ? 'KICK?' : (evt.value === 32 ? '2X KICK' : 'KICK'), width / 2, y);
-        if (selectedNote && selectedNote.id === evt.id) {
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 1;
+        if (selected) {
+          ctx.strokeStyle = '#a5b4fc';
+          ctx.lineWidth = 2;
           ctx.setLineDash([4, 2]);
           ctx.strokeRect(2, y - 8, width - 4, 16);
           ctx.setLineDash([]);
         }
-        return;
+        continue;
       }
 
-      const noteStyles = getNoteStyles(evt.value, evt.mappedType);
-      const x = (laneIndex * laneWidth) + (laneWidth / 2);
-
+      const noteStyles = getNoteStyles(evt.value, cymbalPads.has(evt.id));
       if (evt.duration > 0 && !isDrumsMode) {
         const endY = yOf(tickToSec(evt.tick + evt.duration));
         ctx.strokeStyle = noteStyles.fill;
@@ -782,7 +939,7 @@ export default function App() {
       ctx.textBaseline = 'middle';
       ctx.fillText(noteStyles.label, x, y);
 
-      if (selectedNote && selectedNote.id === evt.id) {
+      if (selected) {
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = 2;
         ctx.setLineDash([4, 2]);
@@ -791,83 +948,299 @@ export default function App() {
         ctx.stroke();
         ctx.setLineDash([]);
       }
-    });
-  }, [chartEvents, currentTime, scrollSpeed, isDrumsMode, selectedNote, tempoMap, bars, tickToSec]);
+    }
 
-  // Click the canvas to select a note.
-  const handleCanvasClick = (e) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const clickX = (e.clientX - rect.left) * (canvas.width / rect.width);
-    const clickY = (e.clientY - rect.top) * (canvas.height / rect.height);
-    const laneWidth = canvas.width / 5;
-    const playheadY = canvas.height - 100;
+    if (marquee) {
+      const x = Math.min(marquee.x0, marquee.x1);
+      const y = Math.min(marquee.y0, marquee.y1);
+      const w = Math.abs(marquee.x1 - marquee.x0);
+      const h = Math.abs(marquee.y1 - marquee.y0);
+      ctx.fillStyle = 'rgba(129, 140, 248, 0.15)';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#a5b4fc';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+      ctx.setLineDash([]);
+    }
+    // notePos reads currentTime/scrollSpeed/tickToSec, which are listed
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartEvents, currentTime, scrollSpeed, isDrumsMode, selectedSet, cymbalPads, tempoMap, bars, tickToSec, waveform, marquee]);
 
+  // --- Selection with the mouse ---------------------------------------------
+
+  const canvasPoint = (e) => {
+    const c = canvasRef.current;
+    const r = c.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(c.width, (e.clientX - r.left) * (c.width / r.width))),
+      y: Math.max(0, Math.min(c.height, (e.clientY - r.top) * (c.height / r.height)))
+    };
+  };
+
+  const noteAt = (x, y) => {
     let found = null;
-    let bestDist = 20;
-    chartEvents.forEach(evt => {
-      if (isFlagValue(evt.value) || evt.type === 'S') return;
-      const y = playheadY - (tickToSec(evt.tick) - currentTime) * scrollSpeed;
-      let laneIndex = evt.value;
-      if (laneIndex > 4) laneIndex = evt.value === 32 ? 0 : 4;
-      if (laneIndex === 0 && isDrumsMode) {
-        if (Math.abs(clickY - y) < 8 && bestDist >= 8) { found = evt; bestDist = Math.abs(clickY - y); }
+    let best = 18;
+    for (const evt of chartEvents) {
+      if (!isPad(evt)) continue;
+      const p = notePos(evt);
+      if (p.y < -30 || p.y > CANVAS_H + 30) continue;
+      // Kicks span the whole highway; a pad on top of a kick wins.
+      const d = p.kick ? Math.abs(y - p.y) * 1.6 + 4 : Math.hypot(x - p.x, y - p.y);
+      if (d < best) { best = d; found = evt; }
+    }
+    return found;
+  };
+
+  const padsInRect = (r) => {
+    const xa = Math.min(r.x0, r.x1), xb = Math.max(r.x0, r.x1);
+    const ya = Math.min(r.y0, r.y1), yb = Math.max(r.y0, r.y1);
+    return chartEvents.filter(isPad).filter(evt => {
+      const p = notePos(evt);
+      if (p.y < ya || p.y > yb) return false;
+      return p.kick || (p.x >= xa && p.x <= xb);
+    }).map(e => e.id);
+  };
+
+  const dragHandlersRef = useRef({});
+  dragHandlersRef.current = {
+    move: (e) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const pt = canvasPoint(e);
+      if (!d.moved && Math.hypot(pt.x - d.x0, pt.y - d.y0) < 5) return;
+      d.moved = true;
+      d.x1 = pt.x;
+      d.y1 = pt.y;
+      setMarquee({ x0: d.x0, y0: d.y0, x1: pt.x, y1: pt.y });
+    },
+    up: () => {
+      const d = dragRef.current;
+      dragRef.current = null;
+      setMarquee(null);
+      if (!d) return;
+      if (d.moved) {
+        const ids = padsInRect(d);
+        setSelectedIds(prev => (d.ctrl || d.shift ? [...new Set([...prev, ...ids])] : ids));
         return;
       }
-      const x = (laneIndex * laneWidth) + (laneWidth / 2);
-      const dist = Math.hypot(clickX - x, clickY - y);
-      if (dist < bestDist) { found = evt; bestDist = dist; }
-    });
-
-    if (found) {
-      setSelectedNote(found);
-      if (found.originalPitch) auditionNote(found.originalPitch);
-    } else {
-      setSelectedNote(null);
+      const hit = noteAt(d.x0, d.y0);
+      if (!hit) { if (!d.ctrl && !d.shift) setSelectedIds([]); return; }
+      if (d.ctrl) {
+        setSelectedIds(prev => (prev.includes(hit.id) ? prev.filter(i => i !== hit.id) : [...prev, hit.id]));
+        selectionAnchorRef.current = hit;
+        return;
+      }
+      if (d.shift && selectionAnchorRef.current) {
+        const a = selectionAnchorRef.current.tick;
+        setSelectedIds(idsInTickRange(chartEvents, Math.min(a, hit.tick), Math.max(a, hit.tick)));
+        return;
+      }
+      setSelectedIds([hit.id]);
+      selectionAnchorRef.current = hit;
+      if (hit.originalPitch) auditionNote(hit.originalPitch);
     }
   };
 
-  // --- Note editing (cymbal notes are a pad + flag pair linked by pairId) ---
-
-  const shiftNoteTicks = (delta) => {
-    if (!selectedNote) return;
-    setChartEvents(prev => prev.map(evt => (
-      evt.id === selectedNote.id || evt.pairId === selectedNote.id ? { ...evt, tick: Math.max(0, evt.tick + delta) } : evt
-    )).sort((a, b) => a.tick - b.tick));
-    setSelectedNote(prev => ({ ...prev, tick: Math.max(0, prev.tick + delta) }));
+  const handleCanvasMouseDown = (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const pt = canvasPoint(e);
+    dragRef.current = { x0: pt.x, y0: pt.y, x1: pt.x, y1: pt.y, moved: false, ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey };
+    const move = (ev) => dragHandlersRef.current.move(ev);
+    const up = (ev) => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+      dragHandlersRef.current.up(ev);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
   };
 
-  const selectedIsCymbal = selectedNote ? chartEvents.some(e => e.pairId === selectedNote.id) : false;
+  // Mouse wheel over the preview scrolls through the song while paused.
+  const wheelRef = useRef(null);
+  wheelRef.current = (e) => {
+    if (playingRef.current) return;
+    const t = Math.max(0, Math.min(playbackLength(), currentTime - e.deltaY / scrollSpeed));
+    pauseTimeRef.current = t;
+    setCurrentTime(t);
+  };
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const onWheel = (e) => { e.preventDefault(); if (wheelRef.current) wheelRef.current(e); };
+    c.addEventListener('wheel', onWheel, { passive: false });
+    return () => c.removeEventListener('wheel', onWheel);
+  }, []);
 
-  const setNoteLane = (laneIndex, cymbal) => {
-    if (!selectedNote) return;
-    const canCymbal = isDrumsMode && laneIndex >= 2 && laneIndex <= 4;
-    const wantCymbal = canCymbal && cymbal;
-    const mappedType = isDrumsMode ? drumMappingId(LANE_NAMES[laneIndex], wantCymbal) : selectedNote.mappedType;
-    setChartEvents(prev => {
-      const out = [];
-      let maxId = 0;
-      for (const evt of prev) maxId = Math.max(maxId, evt.id);
-      for (const evt of prev) {
-        if (evt.pairId === selectedNote.id) continue; // re-added below if needed
-        if (evt.id === selectedNote.id) {
-          out.push({ ...evt, value: laneIndex, mappedType, flagged: laneIndex === 0 ? evt.flagged : false });
-          if (wantCymbal) out.push({ id: maxId + 1, pairId: evt.id, tick: evt.tick, type: 'N', value: 64 + laneIndex, duration: 0, originalPitch: evt.originalPitch, mappedType: `${mappedType}_marker` });
-        } else {
-          out.push(evt);
-        }
-      }
-      return out;
+  // --- Editing (undoable). Cymbal notes are a pad + flag pair (pairId). ------
+
+  const mappedTypeFor = (value, cymbal) => (isDrumsMode ? drumMappingId(LANE_NAMES[value] ?? 'kick', cymbal, value === 32) : `g${value}`);
+
+  // Kicks that were moved, pasted or added are checked against the drum stem again.
+  const recheckKicks = (events) => {
+    if (!kickCheck) return events;
+    return events.map(e => {
+      if (!(isPad(e) && (e.value === 0 || e.value === 32))) return e.flagged ? { ...e, flagged: false } : e;
+      const support = kickCheck.strength(tickToSec(e.tick));
+      return { ...e, support, flagged: support < KICK_FLAG_BELOW };
     });
-    setSelectedNote(prev => ({ ...prev, value: laneIndex, mappedType }));
   };
 
-  const deleteSelectedNote = () => {
-    if (!selectedNote) return;
-    setChartEvents(prev => prev.filter(e => e.id !== selectedNote.id && e.pairId !== selectedNote.id));
-    setSelectedNote(null);
+  // History entries keep the selection with the notes, so undo brings back
+  // what was selected before an edit and redo re-selects what it produced.
+  const pushHistory = () => {
+    const h = historyRef.current;
+    h.undo.push({ events: chartEvents, sel: selectedIds });
+    if (h.undo.length > 200) h.undo.shift();
+    h.redo = [];
+    setHistorySize({ undo: h.undo.length, redo: 0 });
   };
+
+  const commit = (next, nextSelection = null) => {
+    pushHistory();
+    setChartEvents(recheckKicks(next));
+    if (nextSelection) setSelectedIds(nextSelection);
+    editedRef.current = true;
+    setEdited(true);
+  };
+
+  const stepHistory = (from, to) => {
+    const h = historyRef.current;
+    if (!h[from].length) return;
+    h[to].push({ events: chartEvents, sel: selectedIds });
+    const state = h[from].pop();
+    setChartEvents(state.events);
+    setSelectedIds(state.sel.filter(id => state.events.some(e => e.id === id)));
+    setHistorySize({ undo: h.undo.length, redo: h.redo.length });
+    editedRef.current = true;
+    setEdited(true);
+  };
+  const undo = () => stepHistory('undo', 'redo');
+  const redo = () => stepHistory('redo', 'undo');
+
+  // Throw away hand edits and rebuild from the current settings (undoable).
+  const rebuildChart = () => {
+    pushHistory();
+    setChartEvents(compiled.events);
+    editedRef.current = false;
+    setEdited(false);
+    setRebuildPending(false);
+    setSelectedIds([]);
+  };
+
+  const selectAll = () => setSelectedIds(allPadIds(chartEvents));
+  const clearSelection = () => setSelectedIds([]);
+  const selectBars = () => {
+    const from = parseInt(rangeFrom, 10);
+    const to = parseInt(rangeTo || rangeFrom, 10);
+    if (!(from >= 1) || !(to >= from) || from > bars.length) return;
+    const startBeat = bars[from - 1];
+    const endBeat = bars[to] ?? lastBeat + 1;
+    setSelectedIds(idsInTickRange(chartEvents, Math.round(startBeat * 480), Math.round(endBeat * 480) - 1));
+  };
+
+  const copySelection = () => {
+    const clip = copyNotes(chartEvents, selectedIds);
+    if (!clip) return;
+    clipboardRef.current = clip;
+    setClipCount(clip.notes.length);
+  };
+
+  const cutSelection = () => {
+    const clip = copyNotes(chartEvents, selectedIds);
+    if (!clip) return;
+    clipboardRef.current = clip;
+    setClipCount(clip.notes.length);
+    commit(deleteNotes(chartEvents, selectedIds), []);
+  };
+
+  // Where a paste lands: the playhead, snapped to the chosen grid.
+  const pasteTick = () => {
+    const t = Math.max(0, secToTick(currentTime));
+    if (pasteSnap === 'bar') {
+      let best = 0;
+      for (const b of bars) { const bt = Math.round(b * 480); if (Math.abs(bt - t) < Math.abs(best - t)) best = bt; }
+      return best;
+    }
+    const g = Number(pasteSnap);
+    return Math.round(t / g) * g;
+  };
+
+  const pasteClipboard = () => {
+    const clip = clipboardRef.current;
+    if (!clip) return;
+    const { events, ids } = pasteNotes(chartEvents, clip, pasteTick());
+    commit(events, ids);
+  };
+
+  const deleteSelection = () => {
+    if (!selectedIds.length) return;
+    commit(deleteNotes(chartEvents, selectedIds), []);
+  };
+
+  const moveSelection = (delta) => {
+    if (!selectedIds.length) return;
+    commit(moveNotes(chartEvents, selectedIds, delta));
+  };
+
+  const laneSelection = (value, cymbal = null) => {
+    if (!selectedIds.length) return;
+    commit(setLane(chartEvents, selectedIds, value, { cymbal, drums: isDrumsMode, mappedTypeFor }));
+  };
+
+  // Cymbal / tom for the selected yellow, blue and green notes.
+  const cymbalSelection = (cymbal) => {
+    let ev = chartEvents;
+    for (const lane of [2, 3, 4]) {
+      const ids = ev.filter(e => isPad(e) && e.value === lane && selectedSet.has(e.id)).map(e => e.id);
+      if (ids.length) ev = setLane(ev, ids, lane, { cymbal, drums: true, mappedTypeFor });
+    }
+    if (ev !== chartEvents) commit(ev);
+  };
+
+  const removeFlaggedKicks = () => {
+    if (editedRef.current) commit(deleteNotes(chartEvents, flaggedKicks.map(e => e.id)), []);
+    else setDropFlaggedKicks(v => !v);
+  };
+
+  const selectionPads = chartEvents.filter(e => isPad(e) && selectedSet.has(e.id));
+  const selectionHasYBG = selectionPads.some(e => e.value >= 2 && e.value <= 4);
+  const selectionAllCymbal = selectionHasYBG && selectionPads.filter(e => e.value >= 2 && e.value <= 4).every(e => cymbalPads.has(e.id));
+
+  // Keyboard shortcuts (ignored while typing in a field).
+  const keyRef = useRef(null);
+  keyRef.current = (e) => {
+    const tag = (e.target && e.target.tagName) || '';
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(tag) || (e.target && e.target.isContentEditable)) return;
+    const mod = e.ctrlKey || e.metaKey;
+    const k = e.key.toLowerCase();
+    if (mod && k === 'a') { e.preventDefault(); selectAll(); }
+    else if (mod && k === 'c') { if (selectedIds.length) { e.preventDefault(); copySelection(); } }
+    else if (mod && k === 'x') { if (selectedIds.length) { e.preventDefault(); cutSelection(); } }
+    else if (mod && k === 'v') { if (clipboardRef.current) { e.preventDefault(); pasteClipboard(); } }
+    else if (mod && k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+    else if (mod && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
+    else if (mod) return;
+    else if (k === 'delete' || k === 'backspace') { if (selectedIds.length) { e.preventDefault(); deleteSelection(); } }
+    else if (k === 'escape') clearSelection();
+    else if (k === 'arrowup' && selectedIds.length) { e.preventDefault(); moveSelection(e.shiftKey ? 480 : SIXTEENTH); }
+    else if (k === 'arrowdown' && selectedIds.length) { e.preventDefault(); moveSelection(e.shiftKey ? -480 : -SIXTEENTH); }
+    else if (['1', '2', '3', '4', '5'].includes(k) && selectedIds.length) laneSelection(Number(k) - 1);
+    else if (k === 'c' && isDrumsMode && selectionHasYBG) cymbalSelection(true);
+    else if (k === 't' && isDrumsMode && selectionHasYBG) cymbalSelection(false);
+    else if (k === ' ') {
+      e.preventDefault();
+      // A focused button would also "click" on key-up (e.g. Play right after pressing Play).
+      if (tag === 'BUTTON') e.target.blur();
+      if (playingRef.current) handlePause(); else handlePlay();
+    }
+  };
+  useEffect(() => {
+    const h = (e) => { if (keyRef.current) keyRef.current(e); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, []);
 
   // --- Export ---------------------------------------------------------------
 
@@ -927,6 +1300,9 @@ export default function App() {
   const busy = analysis.status === 'running' || analysis.status === 'drums';
   const pitchName = (pitch) => (part?.detected ? DETECT_NAMES[pitch] : null) || (isDrumsMode ? GM_DRUM_MAP[pitch] : null) || `MIDI ${pitch}`;
   const signed = (n) => `${n > 0 ? '+' : n < 0 ? '−' : ''}${Math.abs(n)}`;
+  // After hand edits the flags live on the edited notes; before, the settings decide.
+  const kicksDropped = !edited && dropFlaggedKicks;
+  const kickFlagCount = edited ? flaggedKicks.length : (compileStats?.flaggedKicks || 0);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-indigo-500 selection:text-white pb-12">
@@ -1009,9 +1385,19 @@ export default function App() {
                 placeholder="Choose or drag MIDI file"
                 onFile={handleMidiUpload}
               />
+              <FileDrop
+                label="DAW Tempo Map (optional)"
+                hint="The tempo map from your DAW session: a tempo-map .mid, a Reaper .rpp project or a .dawproject. When it matches the song, the chart uses its beats instead of the detected ones."
+                accept={DAW_ACCEPT}
+                icon={Clock}
+                fileName={dawTempo?.name}
+                placeholder="Choose or drag a DAW file"
+                onFile={handleDawUpload}
+                onClear={dawTempo ? clearDaw : null}
+              />
             </div>
 
-            {(midiMetadata || audioMetadata || stemMetadata) && (
+            {(midiMetadata || audioMetadata || stemMetadata || dawTempo) && (
               <div className="mt-4 p-3 bg-slate-950/60 border border-slate-800 rounded-lg flex flex-col gap-2.5 text-xs">
                 {audioMetadata && (
                   <div>
@@ -1057,6 +1443,24 @@ export default function App() {
                     </div>
                   </div>
                 )}
+                {dawTempo && (
+                  <div className="border-t border-slate-900 pt-2">
+                    <h4 className="font-semibold text-amber-300 flex items-center gap-1.5">
+                      <Clock className="h-3 w-3" /> DAW Tempo Map
+                    </h4>
+                    <div className="flex flex-col gap-1 mt-1 text-slate-400">
+                      <span>{dawTempo.label}{dawTempo.droppedLeadIn > 0 ? ` (${dawTempo.droppedLeadIn} squeezed lead-in ${dawTempo.droppedLeadIn === 1 ? 'beat' : 'beats'} skipped)` : ''}</span>
+                      {dawTempo.warning && <span className="text-amber-300">{dawTempo.warning}</span>}
+                      {dawCompare && (
+                        <span className={dawCompare.agreement >= 0.5 ? 'text-sky-300' : 'text-amber-300'}>
+                          {dawCompare.agreement >= 0.5
+                            ? `Matches the beats in the recording (${Math.round(dawCompare.agreement * 100)}% within 20 ms${dawShift ? `, shifted ${(dawShift * 1000).toFixed(0)} ms to line up` : ''}).`
+                            : `Only ${Math.round(dawCompare.agreement * 100)}% of its beats line up with the recording. It may be from a different edit or mix of the song.`}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1085,9 +1489,9 @@ export default function App() {
                   <span>
                     Tempo map: <strong className="text-white">{tempoSummary.count}</strong> tempo {tempoSummary.count === 1 ? 'event' : 'events'},{' '}
                     {tempoSummary.hi - tempoSummary.lo < 0.05 ? `${tempoSummary.lo.toFixed(1)} BPM` : `${tempoSummary.lo.toFixed(1)}–${tempoSummary.hi.toFixed(1)} BPM`}
-                    {audioFile && <> · beats from the {analysis.summary?.beatSource === 'stem' ? 'drum stem' : 'song'}</>}
+                    {usingDaw ? <> · from the DAW file</> : audioFile && <> · beats from the {analysis.summary?.beatSource === 'stem' ? 'drum stem' : 'song'}</>}
                   </span>
-                  {audioFile && <span className="text-slate-500">The tab&apos;s own tempo is ignored; notes are placed on the recording&apos;s beats.</span>}
+                  {audioFile && <span className="text-slate-500">The tab&apos;s own tempo is ignored; notes are placed on the {usingDaw ? 'DAW map' : 'recording'}&apos;s beats.</span>}
                 </div>
               )}
 
@@ -1100,16 +1504,37 @@ export default function App() {
                 </div>
               )}
 
+              {dawTempo && (
+                <div className="text-xs">
+                  <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">Tempo Map From</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => { setTempoSource('detected'); setManualOffset(null); }}
+                      disabled={!audioFile}
+                      className={`py-1.5 rounded-lg border font-semibold transition disabled:opacity-40 ${!usingDaw ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-950 border-slate-800 text-slate-400'}`}
+                    >
+                      The recording
+                    </button>
+                    <button
+                      onClick={() => { setTempoSource('daw'); setManualOffset(null); }}
+                      className={`py-1.5 rounded-lg border font-semibold transition ${usingDaw ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-950 border-slate-800 text-slate-400'}`}
+                    >
+                      DAW file
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {audioFile && (
                 <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div className="col-span-2 flex items-center justify-between gap-2">
+                  {!usingDaw && <div className="col-span-2 flex items-center justify-between gap-2">
                     <span className="text-slate-400">Detected tempo is half / double?</span>
                     <div className="flex items-center gap-1.5">
                       <button onClick={() => setScale(tracking.tempoScale / 2)} disabled={busy} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 rounded font-semibold">÷2</button>
                       <span className="font-mono text-slate-300 w-8 text-center">{tracking.tempoScale >= 1 ? `×${tracking.tempoScale}` : `÷${1 / tracking.tempoScale}`}</span>
                       <button onClick={() => setScale(tracking.tempoScale * 2)} disabled={busy} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 rounded font-semibold">×2</button>
                     </div>
-                  </div>
+                  </div>}
                   <label className="flex flex-col gap-1 text-slate-400">
                     Tempo range (BPM)
                     <div className="flex items-center gap-1">
@@ -1118,13 +1543,13 @@ export default function App() {
                       <NumberField value={tracking.maxBpm} min={40} max={400} onCommit={v => setTracking(t => ({ ...t, maxBpm: v, minBpm: Math.min(t.minBpm, Math.round(v / 1.25)) }))} />
                     </div>
                   </label>
-                  <label className="flex flex-col gap-1 text-slate-400">
-                    Grid tolerance
+                  <label className="flex flex-col gap-1 text-slate-400" title="Every beat: a tempo for each beat, following every push and pull of the drummer. The others merge beats into fewer tempo changes as long as the grid stays within that many ms of the real beats.">
+                    Tempo map detail
                     <select value={toleranceMs} onChange={e => setToleranceMs(Number(e.target.value))} className="bg-slate-950 border border-slate-800 text-slate-200 rounded px-2 py-1">
-                      <option value={0}>Every beat</option>
-                      <option value={10}>±10 ms</option>
-                      <option value={20}>±20 ms</option>
-                      <option value={40}>±40 ms</option>
+                      <option value={0}>Every beat (meticulous)</option>
+                      <option value={10}>Within ±10 ms</option>
+                      <option value={20}>Within ±20 ms</option>
+                      <option value={40}>Within ±40 ms</option>
                     </select>
                   </label>
                 </div>
@@ -1281,22 +1706,27 @@ export default function App() {
                 </p>
               ) : (
                 <div className="flex flex-col gap-3 text-xs">
-                  <div className={`text-[11px] rounded-lg px-3 py-2 border ${compileStats?.flaggedKicks ? 'text-orange-200 bg-orange-950/40 border-orange-800/50' : 'text-emerald-200 bg-emerald-950/40 border-emerald-800/50'}`}>
-                    {compileStats?.flaggedKicks
-                      ? `${compileStats.flaggedKicks} of the chart's kicks have no kick in the drum stem.${dropFlaggedKicks ? ' They are removed.' : ' They show as dashed orange KICK? lines in the preview.'}`
+                  <div className={`text-[11px] rounded-lg px-3 py-2 border ${kickFlagCount ? 'text-orange-200 bg-orange-950/40 border-orange-800/50' : 'text-emerald-200 bg-emerald-950/40 border-emerald-800/50'}`}>
+                    {kickFlagCount
+                      ? `${kickFlagCount} of the chart's kicks have no kick in the drum stem.${kicksDropped ? ' They are removed.' : ' They show as dashed orange KICK? lines in the preview.'}`
                       : 'Every kick in the chart has a kick in the drum stem.'}
                   </div>
-                  {flaggedKicks.length > 0 && !dropFlaggedKicks && (
+                  {flaggedKicks.length > 0 && (
                     <div className="text-[11px] text-slate-400 max-h-20 overflow-y-auto">
                       At bar.beat: {flaggedKicks.slice(0, 60).map(e => barBeatLabel(e.tick / 480, bars)).join(', ')}{flaggedKicks.length > 60 ? ', …' : ''}
                     </div>
                   )}
-                  {(compileStats?.flaggedKicks > 0) && (
+                  {kickFlagCount > 0 && (
                     <button
-                      onClick={() => setDropFlaggedKicks(v => !v)}
-                      className={`w-full py-2 px-3 rounded-lg font-semibold transition ${dropFlaggedKicks ? 'bg-slate-800 hover:bg-slate-700 text-slate-200' : 'bg-orange-700 hover:bg-orange-600 text-white'}`}
+                      onClick={removeFlaggedKicks}
+                      className={`w-full py-2 px-3 rounded-lg font-semibold transition ${kicksDropped ? 'bg-slate-800 hover:bg-slate-700 text-slate-200' : 'bg-orange-700 hover:bg-orange-600 text-white'}`}
                     >
-                      {dropFlaggedKicks ? 'Put them back' : `Remove ${compileStats.flaggedKicks} unsupported kicks`}
+                      {kicksDropped ? 'Put them back' : `Remove ${kickFlagCount} unsupported kicks`}
+                    </button>
+                  )}
+                  {flaggedKicks.length > 0 && (
+                    <button onClick={() => setSelectedIds(flaggedKicks.map(e => e.id))} className="w-full py-1.5 px-3 rounded-lg border border-slate-700 text-slate-300 hover:border-orange-500 font-semibold transition">
+                      Select them in the preview
                     </button>
                   )}
                 </div>
@@ -1410,7 +1840,7 @@ export default function App() {
                   <SlidersHorizontal className="h-4 w-4 text-indigo-400" />
                   Live Scrolling Fretboard Preview & Chart Editor
                 </h2>
-                <p className="text-xs text-slate-400">Notes, beats and bars follow the real tempo map. Click a note to edit it.</p>
+                <p className="text-xs text-slate-400">Notes, beats and bars follow the real tempo map. Click or drag a box to select notes; scroll the wheel to move through the song.</p>
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-[11px] font-mono text-slate-400">
@@ -1422,13 +1852,28 @@ export default function App() {
 
             <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
               <div className="md:col-span-6 flex flex-col items-center">
-                <div ref={canvasContainerRef} className="relative border border-slate-800 rounded-lg overflow-hidden bg-slate-950 w-[240px]">
-                  <canvas ref={canvasRef} width={240} height={400} onClick={handleCanvasClick} className="cursor-crosshair" />
+                {rebuildPending && (
+                  <div className="w-full max-w-[300px] mb-2 text-[11px] text-amber-200 bg-amber-950/40 border border-amber-800/50 rounded-lg px-3 py-2 flex items-center justify-between gap-2">
+                    <span>Settings changed. Your hand edits are kept until you rebuild.</span>
+                    <button onClick={rebuildChart} className="px-2 py-1 bg-amber-800 hover:bg-amber-700 rounded font-semibold shrink-0">Rebuild</button>
+                  </div>
+                )}
+                <div ref={canvasContainerRef} className="relative border border-slate-800 rounded-lg overflow-hidden bg-slate-950 w-full max-w-[300px]">
+                  <canvas ref={canvasRef} width={CANVAS_W} height={CANVAS_H} onMouseDown={handleCanvasMouseDown} className="cursor-crosshair block w-full h-auto select-none" />
                 </div>
-                <div className="w-[240px] mt-2.5 flex justify-between items-center text-xs text-slate-400">
-                  <span>Scroll Speed:</span>
-                  <input type="range" min="150" max="800" step="25" value={scrollSpeed} onChange={(e) => setScrollSpeed(parseInt(e.target.value))} className="w-32 accent-indigo-500" />
-                  <span>{scrollSpeed}</span>
+                <div className="w-full max-w-[300px] mt-2.5 flex justify-between items-center gap-2 text-xs text-slate-400">
+                  <span>Scroll speed</span>
+                  <input type="range" min="150" max="800" step="25" value={scrollSpeed} onChange={(e) => setScrollSpeed(parseInt(e.target.value))} className="flex-1 accent-indigo-500" />
+                  <span className="w-8 text-right">{scrollSpeed}</span>
+                </div>
+                <div className="w-full max-w-[300px] mt-2 flex justify-between items-center gap-2 text-xs text-slate-400">
+                  <span className="flex items-center gap-1.5"><AudioWaveform className="h-3.5 w-3.5 text-sky-400" /> Waveform</span>
+                  <select value={waveSource} onChange={e => setWaveSource(e.target.value)} className="bg-slate-950 border border-slate-800 text-slate-200 rounded px-2 py-1">
+                    <option value="auto">Auto (stem if loaded)</option>
+                    <option value="stem" disabled={!stemMetadata}>Drum stem</option>
+                    <option value="song" disabled={!audioMetadata}>Song</option>
+                    <option value="off">Off</option>
+                  </select>
                 </div>
               </div>
 
@@ -1470,62 +1915,109 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Selected Note Live Editor */}
-                <div className="bg-slate-950 p-3.5 border border-slate-850 rounded-lg flex-1 flex flex-col justify-between">
-                  <div>
-                    <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                {/* Selection editor */}
+                <div className="bg-slate-950 p-3.5 border border-slate-850 rounded-lg flex-1 flex flex-col gap-3 text-xs">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
                       <Edit3 className="h-3.5 w-3.5 text-indigo-400" />
-                      Active Note Editor
+                      Note Editor
                     </h4>
-                    {selectedNote ? (
-                      <div className="flex flex-col gap-2.5 text-xs text-slate-300">
-                        <div className="flex justify-between items-center">
-                          <span>Bar.beat: <strong className="text-white">{barBeatLabel(selectedNote.tick / 480, bars)}</strong></span>
-                          <span>Time: <strong className="text-indigo-400">{fmtTime(tickToSec(selectedNote.tick) - PAD)}</strong></span>
+                    <div className="flex items-center gap-1">
+                      <button onClick={undo} disabled={!historySize.undo} title="Undo (Ctrl+Z)" className="p-1.5 rounded bg-slate-900 border border-slate-800 hover:bg-slate-850 disabled:opacity-40"><Undo2 className="h-3.5 w-3.5" /></button>
+                      <button onClick={redo} disabled={!historySize.redo} title="Redo (Ctrl+Y)" className="p-1.5 rounded bg-slate-900 border border-slate-800 hover:bg-slate-850 disabled:opacity-40"><Redo2 className="h-3.5 w-3.5" /></button>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-300">
+                      {selectedIds.length ? <><strong className="text-white">{selectedIds.length}</strong> {selectedIds.length === 1 ? 'note' : 'notes'} selected</> : <span className="text-slate-500">Nothing selected</span>}
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <button onClick={selectAll} disabled={!chartEvents.length} title="Select all (Ctrl+A)" className="px-2 py-1 rounded bg-slate-900 border border-slate-800 hover:bg-slate-850 disabled:opacity-40 flex items-center gap-1"><BoxSelect className="h-3.5 w-3.5" /> All</button>
+                      <button onClick={clearSelection} disabled={!selectedIds.length} title="Clear selection (Esc)" className="px-2 py-1 rounded bg-slate-900 border border-slate-800 hover:bg-slate-850 disabled:opacity-40">None</button>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 text-slate-400">
+                    <span>Bars</span>
+                    <input value={rangeFrom} onChange={e => setRangeFrom(e.target.value.replace(/\D/g, ''))} onKeyDown={e => { if (e.key === 'Enter') selectBars(); }} placeholder="from" className="w-14 bg-slate-950 border border-slate-800 text-slate-200 rounded px-2 py-1" />
+                    <span>to</span>
+                    <input value={rangeTo} onChange={e => setRangeTo(e.target.value.replace(/\D/g, ''))} onKeyDown={e => { if (e.key === 'Enter') selectBars(); }} placeholder="to" className="w-14 bg-slate-950 border border-slate-800 text-slate-200 rounded px-2 py-1" />
+                    <button onClick={selectBars} disabled={!rangeFrom || !bars.length} className="px-2 py-1 rounded bg-slate-900 border border-slate-800 hover:bg-slate-850 disabled:opacity-40">Select</button>
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-1">
+                    <button onClick={cutSelection} disabled={!selectedIds.length} title="Cut (Ctrl+X)" className="py-1.5 rounded bg-slate-900 border border-slate-800 hover:bg-slate-850 disabled:opacity-40 flex flex-col items-center gap-0.5"><Scissors className="h-3.5 w-3.5" />Cut</button>
+                    <button onClick={copySelection} disabled={!selectedIds.length} title="Copy (Ctrl+C)" className="py-1.5 rounded bg-slate-900 border border-slate-800 hover:bg-slate-850 disabled:opacity-40 flex flex-col items-center gap-0.5"><Copy className="h-3.5 w-3.5" />Copy</button>
+                    <button onClick={pasteClipboard} disabled={!clipCount} title="Paste at the playhead (Ctrl+V)" className="py-1.5 rounded bg-slate-900 border border-slate-800 hover:bg-slate-850 disabled:opacity-40 flex flex-col items-center gap-0.5"><ClipboardPaste className="h-3.5 w-3.5" />Paste</button>
+                    <button onClick={deleteSelection} disabled={!selectedIds.length} title="Delete (Del)" className="py-1.5 rounded bg-slate-900 border border-slate-800 hover:bg-red-950 hover:border-red-800 text-red-300 disabled:opacity-40 flex flex-col items-center gap-0.5"><Trash2 className="h-3.5 w-3.5" />Delete</button>
+                  </div>
+                  <div className="flex items-center justify-between gap-2 text-slate-400">
+                    <span>{clipCount ? `${clipCount} ${clipCount === 1 ? 'note' : 'notes'} copied. Paste lands at the playhead, snapped to` : 'Paste lands at the playhead, snapped to'}</span>
+                    <select value={pasteSnap} onChange={e => setPasteSnap(e.target.value)} className="bg-slate-950 border border-slate-800 text-slate-200 rounded px-1.5 py-1 shrink-0">
+                      <option value="bar">bar</option>
+                      <option value="480">beat</option>
+                      <option value="240">1/8</option>
+                      <option value="120">1/16</option>
+                      <option value="160">1/8 triplet</option>
+                      <option value="60">1/32</option>
+                    </select>
+                  </div>
+
+                  {selectedIds.length > 0 && (
+                    <div className="flex flex-col gap-2 border-t border-slate-900 pt-2.5">
+                      <div className="grid grid-cols-4 gap-1">
+                        <button onClick={() => moveSelection(-480)} title="Shift+Down" className="p-1 bg-slate-900 border border-slate-800 rounded hover:bg-slate-850 text-[11px]">◀ beat</button>
+                        <button onClick={() => moveSelection(-SIXTEENTH)} title="Down arrow" className="p-1 bg-slate-900 border border-slate-800 rounded hover:bg-slate-850 text-[11px]">◀ 1/16</button>
+                        <button onClick={() => moveSelection(SIXTEENTH)} title="Up arrow" className="p-1 bg-slate-900 border border-slate-800 rounded hover:bg-slate-850 text-[11px]">1/16 ▶</button>
+                        <button onClick={() => moveSelection(480)} title="Shift+Up" className="p-1 bg-slate-900 border border-slate-800 rounded hover:bg-slate-850 text-[11px]">beat ▶</button>
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        <span className="text-slate-400 text-[11px]">Move to lane (keys 1–5)</span>
+                        <div className="grid grid-cols-5 gap-1">
+                          {[0, 1, 2, 3, 4].map(idx => (
+                            <button key={idx} onClick={() => laneSelection(idx)}
+                              className={`p-1.5 font-bold rounded border text-center transition ${selectionPads.length && selectionPads.every(e => e.value === idx) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900 border-slate-850 text-slate-400'}`}>
+                              {isDrumsMode ? ['K', 'R', 'Y', 'B', 'G'][idx] : idx}
+                            </button>
+                          ))}
                         </div>
-                        {selectedNote.flagged && (
-                          <div className="text-[11px] text-orange-200 bg-orange-950/40 border border-orange-800/50 rounded px-2 py-1">
-                            No kick in the drum stem here (strength {selectedNote.support?.toFixed(2)}).
+                        {isDrumsMode && selectionHasYBG && (
+                          <div className="grid grid-cols-2 gap-1">
+                            <button onClick={() => cymbalSelection(true)} title="C"
+                              className={`p-1 rounded border text-[11px] font-semibold ${selectionAllCymbal ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900 border-slate-850 text-slate-400'}`}>Cymbal (C)</button>
+                            <button onClick={() => cymbalSelection(false)} title="T"
+                              className={`p-1 rounded border text-[11px] font-semibold ${!selectionAllCymbal && selectionPads.filter(e => e.value >= 2 && e.value <= 4).every(e => !cymbalPads.has(e.id)) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900 border-slate-850 text-slate-400'}`}>Tom (T)</button>
                           </div>
                         )}
-                        <div className="grid grid-cols-2 gap-2 mt-1">
-                          <button onClick={() => shiftNoteTicks(-SIXTEENTH)} className="p-1 bg-slate-900 border border-slate-800 rounded hover:bg-slate-850 text-[11px]">◀ 1/16 earlier</button>
-                          <button onClick={() => shiftNoteTicks(SIXTEENTH)} className="p-1 bg-slate-900 border border-slate-800 rounded hover:bg-slate-850 text-[11px]">1/16 later ▶</button>
-                        </div>
-                        <div className="flex flex-col gap-1.5 mt-1">
-                          <span className="text-slate-400 text-[11px]">Output Fret/Pad Lane</span>
-                          <div className="grid grid-cols-5 gap-1">
-                            {[0, 1, 2, 3, 4].map(idx => (
-                              <button key={idx} onClick={() => setNoteLane(idx, selectedIsCymbal)}
-                                className={`p-1.5 font-bold rounded border text-center transition ${selectedNote.value === idx ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900 border-slate-850 text-slate-400'}`}>
-                                {isDrumsMode ? ['K', 'R', 'Y', 'B', 'G'][idx] : idx}
-                              </button>
-                            ))}
+                      </div>
+                      {selectedNote && (
+                        <div className="flex flex-col gap-1 text-[11px] text-slate-400 border-t border-slate-900 pt-2">
+                          <div className="flex justify-between">
+                            <span>Bar.beat <strong className="text-white">{barBeatLabel(selectedNote.tick / 480, bars)}</strong></span>
+                            <span>Time <strong className="text-indigo-400">{fmtTime(tickToSec(selectedNote.tick) - PAD)}</strong></span>
                           </div>
-                          {isDrumsMode && selectedNote.value >= 2 && selectedNote.value <= 4 && (
-                            <div className="grid grid-cols-2 gap-1">
-                              <button onClick={() => setNoteLane(selectedNote.value, true)}
-                                className={`p-1 rounded border text-[11px] font-semibold ${selectedIsCymbal ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900 border-slate-850 text-slate-400'}`}>Cymbal</button>
-                              <button onClick={() => setNoteLane(selectedNote.value, false)}
-                                className={`p-1 rounded border text-[11px] font-semibold ${!selectedIsCymbal ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900 border-slate-850 text-slate-400'}`}>Tom</button>
-                            </div>
+                          <span>{selectedNote.originalPitch ? `From: ${pitchName(selectedNote.originalPitch)}` : 'Added by hand'}</span>
+                          {selectedNote.flagged && (
+                            <span className="text-orange-200 bg-orange-950/40 border border-orange-800/50 rounded px-2 py-1">
+                              No kick in the drum stem here (strength {selectedNote.support?.toFixed(2)}).
+                            </span>
                           )}
                         </div>
-                      </div>
-                    ) : (
-                      <div className="text-xs text-slate-500 italic py-6 text-center">
-                        Click any note on the left fretboard lane to load it into the active editor
-                      </div>
-                    )}
-                  </div>
-                  {selectedNote && (
-                    <div className="flex justify-between items-center border-t border-slate-900 pt-2.5 mt-2">
-                      <span className="text-[10px] text-slate-500">{selectedNote.originalPitch ? `From: ${pitchName(selectedNote.originalPitch)}` : 'Added by hand'}</span>
-                      <button onClick={deleteSelectedNote} className="text-red-400 hover:text-red-300 font-semibold flex items-center gap-1 text-[11px]">
-                        <Trash2 className="h-3 w-3" /> Delete Note
-                      </button>
+                      )}
                     </div>
                   )}
+
+                  <details className="text-[11px] text-slate-500 border-t border-slate-900 pt-2">
+                    <summary className="cursor-pointer text-slate-400">Mouse &amp; keyboard</summary>
+                    <ul className="mt-1.5 flex flex-col gap-0.5">
+                      <li>Click a note to select it. Ctrl+click adds or removes one; Shift+click selects everything between.</li>
+                      <li>Drag a box to select an area (Ctrl or Shift adds to the selection). A box catches kicks anywhere across it.</li>
+                      <li>Mouse wheel scrolls through the song while paused. Space plays and pauses.</li>
+                      <li>Ctrl+A all · Ctrl+C copy · Ctrl+X cut · Ctrl+V paste at the playhead · Del delete · Esc clear</li>
+                      <li>Up/Down move 1/16 (Shift: a beat) · 1–5 lane · C cymbal · T tom · Ctrl+Z undo · Ctrl+Y redo</li>
+                    </ul>
+                  </details>
                 </div>
               </div>
             </div>

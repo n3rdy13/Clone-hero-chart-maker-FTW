@@ -1,7 +1,7 @@
 // One-call chart building on top of the engine, shared by the CLI
 // (convert.mjs), the batch converter and the tests. The web app uses the same
 // pieces step by step so each one can be adjusted live.
-import { buildTempoMap } from './engine/tempomap.js';
+import { buildTempoMap, smoothBeats } from './engine/tempomap.js';
 import { midiToPart, pickDefaultTrack } from './engine/part.js';
 import { makeEvidence, autoAlign, makeKickCheck } from './engine/align.js';
 import { detectedPart } from './engine/detect.js';
@@ -11,10 +11,12 @@ import {
   compileChartEvents, chartTempos, generateChartString,
 } from './chartGen.js';
 
-// Chart-time grid (song time + lead-in) from detected beats, reaching to the
-// end of the audio.
-export function gridFromBeats(beats, duration, { pad = LEAD_IN_SECONDS, toleranceMs = 20 } = {}) {
-  return buildTempoMap(beats.map((b) => b + pad), { toleranceMs, endTime: duration + pad });
+// Chart-time grid (song time + lead-in) from beat times, reaching to the end
+// of the audio. Detected beats are smoothed and get one tempo per beat by
+// default ("meticulous"); DAW beats are used as they are (smooth: 0).
+export function gridFromBeats(beats, duration, { pad = LEAD_IN_SECONDS, toleranceMs = 0, smooth = 2 } = {}) {
+  const b = smooth > 0 ? smoothBeats(beats, { smooth }) : beats;
+  return buildTempoMap(b.map((x) => x + pad), { toleranceMs, endTime: duration + pad });
 }
 
 export function defaultMappings(part, isDrums) {
@@ -52,14 +54,18 @@ export function kickCheckFor(acts, pad = LEAD_IN_SECONDS) {
 
 // analysis: { duration, beats, onset, acts } from SongAnalyzer.
 // midi: parsed @tonejs/midi (omit for drumSource 'detect').
+// dawBeats: beat times (song time) from a DAW tempo map; replaces the
+// detected beats for the tempo map when given.
 export function buildChart({
   analysis, midi = null, trackIndex = null, section = 'ExpertDrums', drumSource = 'tab',
   pitchMappings = null, offset = null, meta = {}, musicStream = 'song.ogg',
   autoStarPower = false, spEveryBars = 8, dropFlaggedKicks = false,
-  sensitivity = 0.5, division = 4, pad = LEAD_IN_SECONDS, toleranceMs = 20,
+  sensitivity = 0.5, division = 4, pad = LEAD_IN_SECONDS, toleranceMs = 0, dawBeats = null,
 }) {
   const { duration, beats, onset, acts } = analysis;
-  const map = gridFromBeats(beats, duration, { pad, toleranceMs });
+  const map = dawBeats
+    ? gridFromBeats(dawBeats.filter((b) => b <= duration + 1), duration, { pad, toleranceMs, smooth: 0 })
+    : gridFromBeats(beats, duration, { pad, toleranceMs });
   if (map.gridTimes.length < 2) throw new Error('No steady beat found in the audio.');
   const isDrums = isDrumsSection(section);
   let part;
