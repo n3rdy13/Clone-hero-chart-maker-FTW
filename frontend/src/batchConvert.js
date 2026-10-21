@@ -16,7 +16,7 @@ import { LEAD_IN_SECONDS, generateSongIni, isFlagValue } from './chartGen.js';
 import { padAudioBuffer, audioBufferToWav, decodeForAnalysis } from './audioUtil.js';
 
 export const MIDI_EXTS = ['mid', 'midi'];
-export const AUDIO_EXTS = ['mp3', 'ogg', 'wav', 'flac', 'm4a', 'opus', 'aac'];
+export const AUDIO_EXTS = ['mp3', 'ogg', 'wav', 'flac', 'm4a', 'opus', 'aac', 'webm']; // decoded in the browser
 
 export const extOf = (name) => (name.split('.').pop() || '').toLowerCase();
 export const stripExt = (name) => name.replace(/\.[^.]+$/, '');
