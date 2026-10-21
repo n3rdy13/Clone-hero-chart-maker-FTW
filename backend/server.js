@@ -4,10 +4,29 @@ const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 
-// Direct path setup using escaped Windows backslashes
-const ffmpegPath = 'C:\\Users\\test\\Downloads\\ffmpeg-8.1-full_build-shared\\ffmpeg-8.1-full_build-shared\\bin\\ffmpeg.exe';
-ffmpeg.setFfmpegPath(ffmpegPath);
+// ffmpeg: FFMPEG_PATH if set, else ffmpeg on the PATH, else the Windows build
+// this project was first set up with.
+const resolveFfmpeg = () => {
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    'ffmpeg',
+    'C:\\Users\\test\\Downloads\\ffmpeg-8.1-full_build-shared\\ffmpeg-8.1-full_build-shared\\bin\\ffmpeg.exe'
+  ].filter(Boolean);
+  for (const c of candidates) {
+    const r = spawnSync(c, ['-version'], { encoding: 'utf8' });
+    if (!r.error && r.status === 0) return c;
+  }
+  return null;
+};
+const ffmpegPath = resolveFfmpeg();
+if (ffmpegPath) {
+  ffmpeg.setFfmpegPath(ffmpegPath);
+  console.log(`Using ffmpeg: ${ffmpegPath}`);
+} else {
+  console.warn('ffmpeg not found (set FFMPEG_PATH). Transcoding will fail; the web app falls back to WAV export.');
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;

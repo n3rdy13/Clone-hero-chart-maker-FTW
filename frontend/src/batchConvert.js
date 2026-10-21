@@ -1,17 +1,22 @@
-// Browser-side batch conversion. Pairs MIDI + audio files from a picked folder
-// and writes finished Clone Hero song folders to a picked output folder via the
-// File System Access API. Reuses the same pure logic as the single-file flow.
+// Browser-side batch conversion. Pairs MIDI + audio files (and optional drum
+// stems) from a picked folder and writes finished Clone Hero song folders to a
+// picked output folder via the File System Access API. Uses the same engine as
+// the single-song editor.
 //
-// Name parsing/pairing are pure and unit-tested in Node; buildSongToDirectory is
-// browser-only (Web Audio decode + WAV encode + FS Access writes).
+// Name parsing/pairing are pure and unit-tested in Node; buildSongToDirectory
+// is browser-only (Web Audio decode + WAV encode + FS Access writes).
 
-import { Midi } from '@tonejs/midi';
-import { computeOnsetEnvelope, fitTempoMap, anchorsToBpmEvents, fitWeightForPitch, fitBandForPitch } from './tempoAnalysis.js';
-import { presetMappingForPitch, isDrumsSection, compileChartEvents, generateChartString, generateSongIni } from './chartGen.js';
-import { padAudioBuffer, audioBufferToWav } from './audioUtil.js';
+import * as midiModule from '@tonejs/midi';
+// Vite loads the package's ES build (named export), Node its CommonJS build.
+const Midi = midiModule.Midi ?? midiModule.default?.Midi;
+import { createEngine } from './engine/client.js';
+import { ANALYSIS_SR, DEFAULT_TRACKING } from './engine/analyze.js';
+import { buildChart } from './songBuilder.js';
+import { LEAD_IN_SECONDS, generateSongIni, isFlagValue } from './chartGen.js';
+import { padAudioBuffer, audioBufferToWav, decodeForAnalysis } from './audioUtil.js';
 
 export const MIDI_EXTS = ['mid', 'midi'];
-export const AUDIO_EXTS = ['mp3', 'ogg', 'wav', 'flac', 'm4a', 'opus'];
+export const AUDIO_EXTS = ['mp3', 'ogg', 'wav', 'flac', 'm4a', 'opus', 'aac'];
 
 export const extOf = (name) => (name.split('.').pop() || '').toLowerCase();
 export const stripExt = (name) => name.replace(/\.[^.]+$/, '');
@@ -37,38 +42,48 @@ export const songFolderName = (artist, song) =>
 // tags, and all non-alphanumerics.
 export const normalizeName = (name) => stripExt(name).toLowerCase()
   .replace(/[-_ ]\d{1,2}[-_]\d{1,2}[-_]\d{2,4}\b/g, '')
-  .replace(/custom|export|final|drums?|\bv\d+\b/g, '')
+  .replace(/songsterr|unknown artist/g, '')
+  .replace(/custom|export|final|drums?|stem|\bv\d+\b/g, '')
   .replace(/[^a-z0-9]/g, '');
 
+export const isDrumStemName = (name) => /drum|stem/i.test(stripExt(name));
+
 // Best-effort artist/song from a chart filename like "Artist-Song-06-16-2026".
+// Songsterr's "Unknown Artist" placeholder and a trailing "Drums" are dropped.
 export const parseSongName = (filename) => {
   const base = stripExt(filename)
     .replace(/_custom_export$/i, '')                          // strip tag first…
     .replace(/[-_ ]\d{1,2}[-_]\d{1,2}[-_]\d{2,4}\s*$/, '')    // …so the date is now trailing
     .trim();
   const m = base.match(/^(.*?)\s*-\s*(.+)$/);
-  if (m) return { artist: m[1].trim(), song: m[2].trim() };
-  return { artist: '', song: base };
+  if (m) {
+    const artist = /^unknown artist$/i.test(m[1].trim()) ? '' : m[1].trim();
+    return { artist, song: m[2].replace(/[\s_-]*(songsterr|drums?)\s*$/i, '').trim() || m[2].trim() };
+  }
+  return { artist: '', song: base.replace(/[\s_-]*(songsterr|drums?)\s*$/i, '').trim() || base };
 };
 
-// Pair each MIDI entry to its best-matching audio entry. Entries are
-// { name, handle }. Returns rows with { midi, audio|null, artist, song }.
+const similarity = (a, b) => {
+  if (a === b) return 10000;
+  if (a.includes(b) || b.includes(a)) return Math.min(a.length, b.length) + 100;
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i;
+};
+
+// Pair each MIDI entry to its best-matching song audio, plus a drum stem when
+// one matches too. Entries are { name, handle }. Returns rows with
+// { midi, audio|null, stem|null, artist, song }.
 export const pairFiles = (midis, audios) => midis.map((m) => {
   const mn = normalizeName(m.name);
-  let best = null, bestScore = 0;
-  for (const a of audios) {
-    const an = normalizeName(a.name);
-    let score;
-    if (an === mn) score = 10000;
-    else if (an.includes(mn) || mn.includes(an)) score = Math.min(an.length, mn.length) + 100;
-    else {
-      let i = 0;
-      while (i < an.length && i < mn.length && an[i] === mn[i]) i++;
-      score = i;
-    }
-    if (score > bestScore) { bestScore = score; best = a; }
-  }
-  return { midi: m, audio: bestScore >= 4 ? best : null, ...parseSongName(m.name) };
+  const scored = audios.map((a) => ({ a, score: similarity(normalizeName(a.name), mn) })).filter((x) => x.score >= 4);
+  scored.sort((x, y) => y.score - x.score);
+  const songs = scored.filter((x) => !isDrumStemName(x.a.name));
+  const stems = scored.filter((x) => isDrumStemName(x.a.name));
+  // A lone "drums" file with nothing else is used as the song audio itself.
+  const audio = songs[0]?.a ?? stems[0]?.a ?? null;
+  const stem = songs[0] ? stems[0]?.a ?? null : null;
+  return { midi: m, audio, stem, ...parseSongName(m.name) };
 });
 
 const writeFile = async (dirHandle, name, data) => {
@@ -83,57 +98,37 @@ const writeFile = async (dirHandle, name, data) => {
   await w.close();
 };
 
-// Build one song folder under outDirHandle. midiFile/audioFile are File objects.
+let enginePromise = null;
+const getEngine = () => (enginePromise ??= createEngine());
+
+// Build one song folder under outDirHandle. midiFile/audioFile/stemFile are File objects.
 export const buildSongToDirectory = async ({
-  midiFile, audioFile, artist, song, charter = 'n3rdy13',
-  section = 'ExpertDrums', density = 8, autoStarPower = false, outDirHandle, audioCtx, onStage = () => {}
+  midiFile, audioFile, stemFile = null, artist, song, charter = 'n3rdy13',
+  section = 'ExpertDrums', density = 8, autoStarPower = false, dropFlaggedKicks = false,
+  outDirHandle, audioCtx, onStage = () => {}
 }) => {
   if (!artist || !song) throw new Error('artist and song are required');
 
   onStage('parsing');
   const midi = new Midi(await midiFile.arrayBuffer());
-  const midiBPM = (midi.header.tempos && midi.header.tempos.length) ? midi.header.tempos[0].bpm : 120;
-
-  let trackIndex = 0, max = -1;
-  midi.tracks.forEach((t, i) => { if (t.notes.length > max) { max = t.notes.length; trackIndex = i; } });
-  const trk = midi.tracks[trackIndex];
-  if (!trk || !trk.notes.length) throw new Error('MIDI has no notes');
-
-  const isDrums = isDrumsSection(section);
-  const pitchMappings = {};
-  new Set(trk.notes.map((n) => n.midi)).forEach((p) => { pitchMappings[p] = presetMappingForPitch(p, isDrums); });
 
   onStage('decoding');
-  const decoded = await audioCtx.decodeAudioData(await audioFile.arrayBuffer());
-  const padded = padAudioBuffer(audioCtx, decoded, 2.0);
+  const { buffer, samples } = await decodeForAnalysis(audioFile, ANALYSIS_SR);
+  const stem = stemFile ? (await decodeForAnalysis(stemFile, ANALYSIS_SR)).samples : null;
 
-  let effectiveBPM = midiBPM, drumSyncOffset = 2.0, autoSync = null;
-  if (trk.notes.length >= 12) {
-    onStage('syncing');
-    const mono = new Float32Array(padded.length);
-    for (let c = 0; c < padded.numberOfChannels; c++) {
-      const d = padded.getChannelData(c);
-      for (let i = 0; i < d.length; i++) mono[i] += d[i] / padded.numberOfChannels;
-    }
-    const { bands, fps } = await computeOnsetEnvelope(mono, padded.sampleRate);
-    const ppq = midi.header.ppq || 480;
-    const hits = trk.notes.map((n) => ({ beat: n.ticks / ppq, w: fitWeightForPitch(n.midi), band: fitBandForPitch(n.midi) }));
-    const fit = await fitTempoMap(bands, fps, hits, midiBPM);
-    const globalBPM = parseFloat((60 / fit.alpha).toFixed(3));
-    const offsetSeconds = parseFloat(Math.max(0, fit.anchors[0].time).toFixed(3));
-    const leadInTicks = Math.round(offsetSeconds * globalBPM * 8);
-    autoSync = { bpmEvents: anchorsToBpmEvents(fit.anchors, globalBPM, leadInTicks), globalBPM, offsetSeconds };
-    effectiveBPM = globalBPM; drumSyncOffset = offsetSeconds;
-  }
+  onStage('syncing');
+  const engine = await getEngine();
+  const res = await engine.load(samples, stem, ANALYSIS_SR, DEFAULT_TRACKING);
+  onStage('drums');
+  const acts = await engine.transcribe();
 
   onStage('charting');
-  const chartEvents = compileChartEvents({
-    parsedMidi: midi, trackIndex, pitchMappings, drumSyncOffset,
-    effectiveBPM, targetSection: section, autoStarPower, spDensityMeasures: density
+  const built = buildChart({
+    analysis: { duration: res.summary.duration, beats: res.beats, onset: res.onset, acts },
+    midi, section, meta: { name: song, artist, charter }, musicStream: 'song.wav',
+    autoStarPower, spEveryBars: density, dropFlaggedKicks
   });
-  const chartString = generateChartString({
-    parsedMidi: midi, chartEvents, targetSection: section, effectiveBPM, midiBPM, drumSyncOffset, autoSync
-  });
+  const padded = padAudioBuffer(audioCtx, buffer, LEAD_IN_SECONDS);
   const iniString = generateSongIni({
     title: song, artist, charter, musicStream: 'song.wav', songLengthMs: Math.round(padded.duration * 1000)
   });
@@ -149,14 +144,18 @@ export const buildSongToDirectory = async ({
   } catch (e) {
     throw new Error(`couldn't create folder "${folderName}" (${e.name}: ${e.message})`);
   }
-  await writeFile(dir, 'notes.chart', chartString);
+  await writeFile(dir, 'notes.chart', built.chart);
   await writeFile(dir, 'song.ini', iniString);
   await writeFile(dir, 'song.wav', wavBlob);
 
+  const bpms = built.map.events.filter((e) => !e.leadIn).map((e) => e.bpm).sort((a, b) => a - b);
   return {
     folderName,
-    notes: chartEvents.filter((e) => e.type === 'N' && ![66, 67, 68].includes(e.value)).length,
-    starPower: chartEvents.filter((e) => e.type === 'S').length,
-    bpm: effectiveBPM, autoSynced: !!autoSync
+    notes: built.events.filter((e) => e.type === 'N' && !isFlagValue(e.value)).length,
+    starPower: built.events.filter((e) => e.type === 'S').length,
+    bpm: bpms.length ? bpms[bpms.length >> 1] : 0,
+    flaggedKicks: built.stats.flaggedKicks,
+    removedKicks: built.stats.removedKicks,
+    beatSource: res.summary.beatSource,
   };
 };

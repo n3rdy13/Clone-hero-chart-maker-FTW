@@ -1,16 +1,23 @@
-// Headless Clone Hero song builder — automates the whole manual workflow:
-//   add MIDI -> add MP3 -> auto-sync tempo map -> set artist/song/charter ->
-//   build the song folder straight into the Clone Hero Songs directory.
+// Headless Clone Hero song builder — automates the whole workflow:
+//   song audio (+ optional drum stem) -> beat-mapped tempo map -> tab placed on
+//   the beats -> kick check -> song folder written into the Clone Hero Songs
+//   directory.
 //
-// Reuses the SAME pure logic as the web app (tempoAnalysis.js + chartGen.js),
-// so the output matches what the UI produces. Audio is decoded and re-encoded
-// with ffmpeg (a real 2s-padded Ogg Vorbis — no MP3-as-ogg, no CH freeze).
+// Reuses the SAME engine as the web app (src/engine + src/songBuilder.js), so
+// the output matches what the UI produces. Audio is decoded and re-encoded with
+// ffmpeg (a real 2 s-padded Ogg Vorbis — no MP3-as-ogg, no CH freeze).
 //
 // Usage (flags, positional files, or interactive prompts for anything missing):
-//   node convert.mjs --midi song.mid --mp3 song.mp3 --artist "Deftones" --song "Around the Fur" --charter n3rdy13
-//   node convert.mjs "song.mid" "song.mp3"        (then it prompts for text)
-//   node convert.mjs                              (fully interactive)
-// Optional: --section ExpertDrums  --density 8  --track <index>  --out "<dir>"
+//   node convert.mjs --midi tab.mid --audio song.m4a --stem drums.m4a --artist "Deftones" --song "Around the Fur"
+//   node convert.mjs "tab.mid" "song.mp3"           (then it prompts for text)
+//   node convert.mjs                                 (fully interactive)
+// Options:
+//   --stem <file>              drum stem split from the same song (better beats + kick check)
+//   --detect                   chart detected drums instead of a MIDI tab
+//   --drop-unsupported-kicks   remove tab kicks the drum stem doesn't back up (default: just report them)
+//   --offset <beats>           place the tab by hand (grid beat of tab beat 0)
+//   --starpower --density 8    auto star power, one phrase per N bars
+//   --section ExpertDrums  --track <index>  --charter <name>  --out "<dir>"
 
 import fs from 'fs';
 import path from 'path';
@@ -18,11 +25,11 @@ import readline from 'readline';
 import { spawnSync } from 'child_process';
 import pkg from '@tonejs/midi';
 const { Midi } = pkg;
-import { computeOnsetEnvelope, fitTempoMap, anchorsToBpmEvents, fitWeightForPitch, fitBandForPitch } from './src/tempoAnalysis.js';
-import { presetMappingForPitch, isDrumsSection, compileChartEvents, generateChartString, generateSongIni } from './src/chartGen.js';
+import { SongAnalyzer, ANALYSIS_SR, DEFAULT_TRACKING } from './src/engine/analyze.js';
+import { buildChart } from './src/songBuilder.js';
+import { LEAD_IN_SECONDS, generateSongIni, barStartBeats, isFlagValue } from './src/chartGen.js';
 
 const DEFAULT_OUT = 'C:\\Users\\test\\Documents\\Clone Hero\\Songs';
-const SR = 44100;
 
 // --- ffmpeg -----------------------------------------------------------------
 const resolveFfmpeg = () => {
@@ -39,6 +46,7 @@ const resolveFfmpeg = () => {
 };
 
 // --- arg parsing ------------------------------------------------------------
+const FLAGS = new Set(['starpower', 'detect', 'drop-unsupported-kicks']);
 const parseArgs = (argv) => {
   const opts = { section: 'ExpertDrums', density: 8, out: DEFAULT_OUT };
   const positionals = [];
@@ -46,17 +54,21 @@ const parseArgs = (argv) => {
     const a = argv[i];
     if (a.startsWith('--')) {
       const key = a.slice(2);
-      if (key === 'starpower') { opts.starpower = true; continue; } // boolean flag (default off)
+      if (FLAGS.has(key)) { opts[key] = true; continue; }
       const val = argv[i + 1]; i++;
-      if (key === 'density' || key === 'track') opts[key] = parseInt(val);
+      if (key === 'density' || key === 'track' || key === 'offset') opts[key] = parseInt(val);
+      else if (key === 'mp3') opts.audio = val;
       else opts[key] = val;
     } else positionals.push(a);
   }
-  // Sort loose file args by extension.
+  // Sort loose file args by extension: MIDI, then song audio, then a stem.
   for (const p of positionals) {
     const ext = path.extname(p).toLowerCase();
     if (['.mid', '.midi'].includes(ext) && !opts.midi) opts.midi = p;
-    else if (['.mp3', '.wav', '.ogg', '.flac', '.m4a'].includes(ext) && !opts.mp3) opts.mp3 = p;
+    else if (['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.opus', '.aac'].includes(ext)) {
+      if (!opts.audio) opts.audio = p;
+      else if (!opts.stem) opts.stem = p;
+    }
   }
   return opts;
 };
@@ -69,7 +81,7 @@ const sanitize = (s) => s.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, 
 
 // --- audio via ffmpeg -------------------------------------------------------
 const decodeMonoPCM = (ffmpeg, input) => {
-  const r = spawnSync(ffmpeg, ['-v', 'error', '-i', input, '-f', 'f32le', '-ac', '1', '-ar', String(SR), '-'],
+  const r = spawnSync(ffmpeg, ['-v', 'error', '-i', input, '-f', 'f32le', '-ac', '1', '-ar', String(ANALYSIS_SR), '-'],
     { maxBuffer: 1024 * 1024 * 1024 });
   if (r.status !== 0) throw new Error('ffmpeg decode failed: ' + (r.stderr ? r.stderr.toString() : r.status));
   const buf = r.stdout;
@@ -82,23 +94,28 @@ const decodeMonoPCM = (ffmpeg, input) => {
 const encodeOgg = (ffmpeg, input, outPath) => {
   // -vn drops embedded album art; -map_metadata -1 strips ALL source tags.
   // Carried-over MP4/ID3 tags in the Vorbis comments make Clone Hero black-screen.
+  const ms = Math.round(LEAD_IN_SECONDS * 1000);
   const r = spawnSync(ffmpeg, ['-y', '-v', 'error', '-i', input,
-    '-af', 'adelay=2000|2000', '-vn', '-map_metadata', '-1',
+    '-af', `adelay=${ms}|${ms}`, '-vn', '-map_metadata', '-1',
     '-acodec', 'libvorbis', '-q:a', '6', '-f', 'ogg', outPath]);
   if (r.status !== 0) throw new Error('ffmpeg encode failed: ' + (r.stderr ? r.stderr.toString() : r.status));
 };
+
+const fmtTime = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(2).padStart(5, '0')}`;
 
 // --- main -------------------------------------------------------------------
 const main = async () => {
   const opts = parseArgs(process.argv.slice(2));
   const ffmpeg = resolveFfmpeg();
+  const detect = Boolean(opts.detect);
 
   // Fill missing inputs interactively.
-  const needPrompt = !opts.midi || !opts.mp3 || !opts.artist || !opts.song;
+  const needPrompt = (!detect && !opts.midi) || !opts.audio || !opts.artist || !opts.song;
   if (needPrompt) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    if (!opts.midi) opts.midi = await prompt(rl, 'Path to MIDI (.mid)');
-    if (!opts.mp3) opts.mp3 = await prompt(rl, 'Path to audio (.mp3)');
+    if (!detect && !opts.midi) opts.midi = await prompt(rl, 'Path to drum tab / MIDI (.mid)');
+    if (!opts.audio) opts.audio = await prompt(rl, 'Path to song audio (.mp3 / .m4a / .ogg / .wav)');
+    if (opts.stem === undefined) opts.stem = await prompt(rl, 'Path to drum stem (optional, Enter to skip)');
     if (!opts.artist) opts.artist = await prompt(rl, 'Artist');
     if (!opts.song) opts.song = await prompt(rl, 'Song title');
     if (!opts.charter) opts.charter = await prompt(rl, 'Charter', 'n3rdy13');
@@ -108,65 +125,65 @@ const main = async () => {
 
   // Strip accidental surrounding quotes from drag-dropped paths.
   const clean = p => p && p.replace(/^"(.*)"$/, '$1');
-  opts.midi = clean(opts.midi); opts.mp3 = clean(opts.mp3);
+  opts.midi = clean(opts.midi); opts.audio = clean(opts.audio); opts.stem = clean(opts.stem) || null;
 
-  if (!fs.existsSync(opts.midi)) throw new Error('MIDI not found: ' + opts.midi);
-  if (!fs.existsSync(opts.mp3)) throw new Error('Audio not found: ' + opts.mp3);
+  if (!detect && !fs.existsSync(opts.midi)) throw new Error('MIDI not found: ' + opts.midi);
+  if (!fs.existsSync(opts.audio)) throw new Error('Audio not found: ' + opts.audio);
+  if (opts.stem && !fs.existsSync(opts.stem)) throw new Error('Drum stem not found: ' + opts.stem);
 
-  console.log(`\n[1/5] Parsing MIDI: ${path.basename(opts.midi)}`);
-  const midi = new Midi(fs.readFileSync(opts.midi));
-  const midiBPM = (midi.header.tempos && midi.header.tempos.length) ? midi.header.tempos[0].bpm : 120;
+  const midi = detect ? null : new Midi(fs.readFileSync(opts.midi));
+  if (midi) console.log(`\n[1/5] Parsed MIDI: ${path.basename(opts.midi)} (${midi.tracks.length} tracks)`);
 
-  // Track: explicit --track, else the one with the most notes (app default).
-  let trackIndex = Number.isInteger(opts.track) ? opts.track : 0;
-  if (!Number.isInteger(opts.track)) {
-    let max = -1;
-    midi.tracks.forEach((t, i) => { if (t.notes.length > max) { max = t.notes.length; trackIndex = i; } });
-  }
-  const track = midi.tracks[trackIndex];
-  if (!track || !track.notes.length) throw new Error('Selected MIDI track has no notes.');
-  console.log(`      track [${trackIndex}] "${track.name || 'Unnamed'}" — ${track.notes.length} notes, MIDI tempo ${midiBPM.toFixed(2)} BPM`);
-
-  // Preset pitch mappings.
-  const isDrums = isDrumsSection(opts.section);
-  const pitchMappings = {};
-  new Set(track.notes.map(n => n.midi)).forEach(p => { pitchMappings[p] = presetMappingForPitch(p, isDrums); });
-
-  // Auto-sync tempo map against the audio (mirrors the app's runAutoTempoSync).
-  console.log(`[2/5] Decoding audio + fitting tempo map (this can take ~10-30s)…`);
-  let effectiveBPM = midiBPM, drumSyncOffset = 2.0, autoSync = null;
-  if (track.notes.length >= 12) {
-    const rawMono = decodeMonoPCM(ffmpeg, opts.mp3);
-    const padSamples = Math.round(2.0 * SR);
-    const mono = new Float32Array(padSamples + rawMono.length);
-    mono.set(rawMono, padSamples); // 2s silence lead-in, matching the exported Ogg
-    const { bands, fps } = await computeOnsetEnvelope(mono, SR);
-    const ppq = midi.header.ppq || 480;
-    const hits = track.notes.map(n => ({ beat: n.ticks / ppq, w: fitWeightForPitch(n.midi), band: fitBandForPitch(n.midi) }));
-    const fit = await fitTempoMap(bands, fps, hits, midiBPM);
-    const globalBPM = parseFloat((60 / fit.alpha).toFixed(3));
-    const offsetSeconds = parseFloat(Math.max(0, fit.anchors[0].time).toFixed(3));
-    const leadInTicks = Math.round(offsetSeconds * globalBPM * 8);
-    autoSync = { bpmEvents: anchorsToBpmEvents(fit.anchors, globalBPM, leadInTicks), globalBPM, offsetSeconds };
-    effectiveBPM = globalBPM; drumSyncOffset = offsetSeconds;
-    console.log(`      fitted ${globalBPM.toFixed(2)} BPM, lead-in ${offsetSeconds.toFixed(3)}s, ${autoSync.bpmEvents.length} tempo event(s)`);
-  } else {
-    console.log(`      too few notes to fit — using MIDI tempo ${midiBPM.toFixed(2)} with a 2.0s lead-in`);
-  }
-
-  // Compile chart. Star power is opt-in via --starpower (off by default).
-  console.log(`[3/5] Compiling chart events${opts.starpower ? ' + star power' : ''}…`);
-  const chartEvents = compileChartEvents({
-    parsedMidi: midi, trackIndex, pitchMappings, drumSyncOffset,
-    effectiveBPM, targetSection: opts.section, autoStarPower: !!opts.starpower, spDensityMeasures: opts.density
+  console.log(`[2/5] Decoding audio and finding beats…`);
+  const analyzer = new SongAnalyzer();
+  const summary = analyzer.load({
+    mix: decodeMonoPCM(ffmpeg, opts.audio),
+    stem: opts.stem ? decodeMonoPCM(ffmpeg, opts.stem) : null,
+    sr: ANALYSIS_SR
   });
-  const noteCount = chartEvents.filter(e => e.type === 'N' && ![66, 67, 68].includes(e.value)).length;
-  const spCount = chartEvents.filter(e => e.type === 'S').length;
-  console.log(`      ${noteCount} notes, ${spCount} star power phrase(s)`);
+  if (summary.stem) {
+    console.log(summary.beatSource === 'stem'
+      ? `      drum stem lines up with the song (offset ${(summary.stem.shift * 1000).toFixed(1)} ms, match ${summary.stem.match.toFixed(2)})`
+      : `      WARNING: the drum stem doesn't match the song (match ${summary.stem.match.toFixed(2)}); using the song for beats, kick check off`);
+  }
+  const { beats } = analyzer.track(DEFAULT_TRACKING);
+  console.log(`      ${beats.length} beats from the ${summary.beatSource === 'stem' ? 'drum stem' : 'song'}; detecting drums…`);
+  const acts = analyzer.transcribe();
 
-  const chartString = generateChartString({
-    parsedMidi: midi, chartEvents, targetSection: opts.section, effectiveBPM, midiBPM, drumSyncOffset, autoSync
+  console.log(`[3/5] Building chart…`);
+  const built = buildChart({
+    analysis: { duration: summary.duration, beats, onset: analyzer.onset, acts },
+    midi, trackIndex: Number.isInteger(opts.track) ? opts.track : null,
+    section: opts.section, drumSource: detect ? 'detect' : 'tab',
+    offset: Number.isInteger(opts.offset) ? opts.offset : null,
+    meta: { name: opts.song, artist: opts.artist, charter: opts.charter },
+    musicStream: 'song.ogg', autoStarPower: Boolean(opts.starpower), spEveryBars: opts.density,
+    dropFlaggedKicks: Boolean(opts['drop-unsupported-kicks'])
   });
+  const bpms = built.map.events.filter(e => !e.leadIn).map(e => e.bpm);
+  console.log(`      tempo map: ${bpms.length} tempo events, ${Math.min(...bpms).toFixed(1)}–${Math.max(...bpms).toFixed(1)} BPM`);
+  if (!detect) {
+    const start = built.map.gridTimes[Math.max(0, Math.min(built.map.gridTimes.length - 1, built.offset))] - LEAD_IN_SECONDS;
+    const alts = built.align?.alternatives?.length ? ` (close calls: ${built.align.alternatives.map(a => `${a.offset - built.offset > 0 ? '+' : ''}${a.offset - built.offset}${a.outside ? ` (cuts ${a.outside} notes)` : ''}`).join(', ')} beats — use --offset to override)` : '';
+    console.log(`      tab bar 1 placed at ${fmtTime(Math.max(0, start))} (grid beat ${built.offset})${alts}`);
+  }
+  const s = built.stats;
+  const noteCount = built.events.filter(e => e.type === 'N' && !isFlagValue(e.value)).length;
+  console.log(`      ${noteCount} notes, ${built.events.filter(e => e.type === 'S').length} star power phrase(s)` +
+    (s.early ? `, ${s.early} before the song` : '') + (s.late ? `, ${s.late} after the end` : '') + (s.moved ? `, ${s.moved} toms moved` : ''));
+  if (built.kickCheck) {
+    if (s.flaggedKicks) {
+      const bars = barStartBeats(built.timeSigs, built.map.gridTimes.length - 1);
+      const label = (beat) => { let i = 0; while (i + 1 < bars.length && bars[i + 1] <= beat + 1e-9) i++; return `${i + 1}.${Number((beat - bars[i] + 1).toFixed(2))}`; };
+      const flagged = built.events.filter(e => e.flagged).map(e => label(e.tick / 480));
+      console.log(`      kick check: ${s.flaggedKicks} kicks have no kick in the drum stem${s.removedKicks ? ' (removed)' : ' (kept; add --drop-unsupported-kicks to remove them)'}`);
+      if (!s.removedKicks) console.log(`        at bar.beat: ${flagged.slice(0, 40).join(', ')}${flagged.length > 40 ? ', …' : ''}`);
+    } else {
+      console.log('      kick check: every kick has a kick in the drum stem');
+    }
+  } else if (!detect) {
+    console.log('      kick check: skipped (needs --stem)');
+  }
 
   // Output folder.
   const folderName = sanitize(`${opts.artist} - ${opts.song}`);
@@ -174,20 +191,11 @@ const main = async () => {
   fs.mkdirSync(destDir, { recursive: true });
 
   console.log(`[4/5] Encoding padded Ogg…`);
-  encodeOgg(ffmpeg, opts.mp3, path.join(destDir, 'song.ogg'));
+  encodeOgg(ffmpeg, opts.audio, path.join(destDir, 'song.ogg'));
 
   console.log(`[5/5] Writing chart + ini…`);
-  const rawDuration = (() => {
-    // Derive shipped length from the padded Ogg we just wrote.
-    const probe = spawnSync(ffmpeg.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1'),
-      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nk=1:nw=1', path.join(destDir, 'song.ogg')],
-      { encoding: 'utf8' });
-    const d = parseFloat((probe.stdout || '').trim());
-    return isFinite(d) ? d : null;
-  })();
-  const songLengthMs = rawDuration ? Math.round(rawDuration * 1000) : 180000;
-
-  fs.writeFileSync(path.join(destDir, 'notes.chart'), chartString);
+  const songLengthMs = Math.round((summary.duration + LEAD_IN_SECONDS) * 1000);
+  fs.writeFileSync(path.join(destDir, 'notes.chart'), built.chart);
   fs.writeFileSync(path.join(destDir, 'song.ini'), generateSongIni({
     title: opts.song, artist: opts.artist, charter: opts.charter, musicStream: 'song.ogg', songLengthMs
   }));

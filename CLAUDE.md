@@ -19,6 +19,7 @@ npm run install-all
 npm run start-backend
 npm run build-frontend
 npm run start-frontend
+npm test
 ```
 
 ## Conventions
