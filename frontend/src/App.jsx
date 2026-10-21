@@ -138,6 +138,28 @@ const fmtTime = (t) => {
   return `${m}:${s.toFixed(2).padStart(5, '0')}`;
 };
 
+// m:ss, for stretches of the song.
+const fmtClock = (t) => {
+  const s = Math.max(0, Math.round(t));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+// One-line notes on the metrical-level check of the detected beats (see
+// engine/dsp/meter.js): stretches fixed, suspicious stretches left alone, and
+// stretches where the drum hits still miss the 16th grid.
+const meterNotes = (meter) => {
+  if (!meter) return {};
+  const range = (s) => `${fmtClock(s.from)}–${fmtClock(s.to)}`;
+  const ratio = (r) => (Math.abs(r - 2 / 3) < 1e-6 ? '2/3' : Math.abs(r - 1.5) < 1e-6 ? '3/2' : r < 1 ? 'half' : 'double');
+  const list = (xs, f) => xs.slice(0, 3).map(f).join(', ') + (xs.length > 3 ? ` and ${xs.length - 3} more` : '');
+  const n = meter.fixed.length;
+  return {
+    fixed: n ? `Fixed ${n} ${n === 1 ? 'stretch' : 'stretches'} the beat tracker read at the wrong tempo: ${list(meter.fixed, s => `${range(s)} (${ratio(s.ratio)}: ${s.trackedBpm.toFixed(0)} → ${s.bpm.toFixed(0)} BPM)`)}.` : null,
+    kept: meter.kept.length ? `Left ${list(meter.kept, s => `${range(s)} at ${s.trackedBpm.toFixed(0)} BPM`)} (${ratio(meter.kept[0].ratio)} of the song's ${meter.dominantBpm.toFixed(0)}): the drum hits fit it as well, so it may be a real tempo change.` : null,
+    offGrid: meter.offGrid.length ? `Drum hits miss the 16th grid at ${list(meter.offGrid, range)}. Check the tempo map there (swing and triplets do this too).` : null,
+  };
+};
+
 // Bar.beat label of a chart beat, from bar line positions.
 const barBeatLabel = (beat, bars) => {
   let i = 0;
@@ -177,7 +199,7 @@ export default function App() {
   // --- Analysis (beats + drum activations) ---------------------------------
   const engineRef = useRef(null);
   const analysisTokenRef = useRef(0);
-  const [analysis, setAnalysis] = useState({ status: 'idle', message: '', summary: null, beats: [], onset: null, acts: null });
+  const [analysis, setAnalysis] = useState({ status: 'idle', message: '', summary: null, beats: [], meter: null, onset: null, acts: null });
   const [tracking, setTracking] = useState(DEFAULT_TRACKING);
   const [toleranceMs, setToleranceMs] = useState(0); // 0 = one tempo per beat ("meticulous")
   const [dawTempo, setDawTempo] = useState(null); // tempo map read from a DAW session file
@@ -424,12 +446,12 @@ export default function App() {
     const stem = stemSamplesRef.current;
     (async () => {
       const started = performance.now();
-      setAnalysis({ status: 'running', message: stem ? 'Lining up the drum stem and finding beats…' : 'Finding beats…', summary: null, beats: [], onset: null, acts: null });
+      setAnalysis({ status: 'running', message: stem ? 'Lining up the drum stem and finding beats…' : 'Finding beats…', summary: null, beats: [], meter: null, onset: null, acts: null });
       try {
         const engine = await getEngine();
         const res = await engine.load(mix, stem, ANALYSIS_SR, tracking);
         if (token !== analysisTokenRef.current) return;
-        setAnalysis({ status: 'drums', message: 'Beats found. Detecting drums for alignment and the kick check…', summary: res.summary, beats: res.beats, onset: res.onset, acts: null });
+        setAnalysis({ status: 'drums', message: 'Beats found. Detecting drums for alignment and the kick check…', summary: res.summary, beats: res.beats, meter: res.meter, onset: res.onset, acts: null });
         const acts = await engine.transcribe();
         if (token !== analysisTokenRef.current) return;
         setAnalysis(prev => ({ ...prev, status: 'done', acts, message: `Analysed in ${((performance.now() - started) / 1000).toFixed(1)} s.` }));
@@ -444,7 +466,7 @@ export default function App() {
   }, [audioVersion]);
 
   // Tempo range or ÷2/×2 changed: re-track beats (cheap, reuses the envelopes).
-  const trackingKey = `${tracking.minBpm}:${tracking.maxBpm}:${tracking.tempoScale}`;
+  const trackingKey = `${tracking.minBpm}:${tracking.maxBpm}:${tracking.tempoScale}:${tracking.meterFix}`;
   const lastTrackingKeyRef = useRef(trackingKey);
   useEffect(() => {
     if (lastTrackingKeyRef.current === trackingKey) return;
@@ -456,7 +478,7 @@ export default function App() {
         const res = await (await getEngine()).track(tracking);
         if (token !== analysisTokenRef.current) return;
         setManualOffset(null);
-        setAnalysis(prev => ({ ...prev, beats: res.beats, message: 'Beats re-tracked.' }));
+        setAnalysis(prev => ({ ...prev, beats: res.beats, meter: res.meter, message: 'Beats re-tracked.' }));
       } catch (err) {
         setAnalysis(prev => ({ ...prev, message: `Re-tracking failed: ${err.message}` }));
       }
@@ -1492,6 +1514,14 @@ export default function App() {
                     {usingDaw ? <> · from the DAW file</> : audioFile && <> · beats from the {analysis.summary?.beatSource === 'stem' ? 'drum stem' : 'song'}</>}
                   </span>
                   {audioFile && <span className="text-slate-500">The tab&apos;s own tempo is ignored; notes are placed on the {usingDaw ? 'DAW map' : 'recording'}&apos;s beats.</span>}
+                  {!usingDaw && audioFile && (() => {
+                    const notes = meterNotes(analysis.meter);
+                    return <>
+                      {notes.fixed && <span className="text-emerald-300">{notes.fixed}</span>}
+                      {notes.kept && <span className="text-slate-400">{notes.kept}</span>}
+                      {notes.offGrid && <span className="text-amber-300">{notes.offGrid}</span>}
+                    </>;
+                  })()}
                 </div>
               )}
 
@@ -1535,6 +1565,10 @@ export default function App() {
                       <button onClick={() => setScale(tracking.tempoScale * 2)} disabled={busy} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 rounded font-semibold">×2</button>
                     </div>
                   </div>}
+                  {!usingDaw && <label className="col-span-2 flex items-center gap-2 text-slate-400" title="The beat tracker can lock onto 2/3 or 3/2 of the real tempo (or half or double) for a while, for example in a tom groove with no backbeat. Those stretches are re-tracked at the song's main tempo when the drum hits fit it better, then every beat is fitted to the drum hits around it. Turn this off for a song that really changes tempo that way, to get the tracker's beats as they are.">
+                    <input type="checkbox" checked={tracking.meterFix} disabled={busy} onChange={e => setTracking(t => ({ ...t, meterFix: e.target.checked }))} />
+                    Fix stretches tracked at 2/3, 3/2, half or double tempo
+                  </label>}
                   <label className="flex flex-col gap-1 text-slate-400">
                     Tempo range (BPM)
                     <div className="flex items-center gap-1">

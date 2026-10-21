@@ -8,11 +8,13 @@
 import { onsetStrength } from './dsp/onset.js';
 import { estimateTempoCurve } from './dsp/tempo.js';
 import { trackBeats } from './dsp/beats.js';
+import { pickOnsets, repairMetricalLevel, gridCheck } from './dsp/meter.js';
+import { fitBeatsToOnsets } from './tempomap.js';
 import { melSpectrogram, separateDrums } from './drums/transcribe.js';
 import { ComplexFFT } from './dsp/fft.js';
 
 export const ANALYSIS_SR = 22050;
-export const DEFAULT_TRACKING = { minBpm: 60, maxBpm: 200, tempoScale: 1 };
+export const DEFAULT_TRACKING = { minBpm: 60, maxBpm: 200, tempoScale: 1, meterFix: true };
 
 // How well the stem must correlate with the song before it is trusted for
 // beats and drum checks. A stem split from the song scores ~0.4-0.6; a stem
@@ -52,14 +54,44 @@ export class SongAnalyzer {
     return { ...this.mixOnset, shift: 0 };
   }
 
-  track({ minBpm = DEFAULT_TRACKING.minBpm, maxBpm = DEFAULT_TRACKING.maxBpm, tempoScale = 1, priorBpm = 120 } = {}) {
+  // Beats of the recording. With `meterFix` (the default), stretches the
+  // tracker locked onto 2/3, 3/2, 1/2 or 2x of the song's dominant tempo are
+  // re-tracked at the dominant level, and every beat is then fitted to the
+  // drum onsets around it (see dsp/meter.js and fitBeatsToOnsets).
+  //
+  // Returns { beats, curve, meter }. meter: { dominantBpm, fixed: spans
+  // re-tracked, kept: suspicious spans the onsets didn't confirm, offGrid:
+  // stretches where hits still don't fit a 16th grid (gridCheck) }, or null
+  // with meterFix off. Times are on the song timeline.
+  track({ minBpm = DEFAULT_TRACKING.minBpm, maxBpm = DEFAULT_TRACKING.maxBpm, tempoScale = 1, priorBpm = 120, meterFix = true } = {}) {
     if (!this.mixOnset) throw new Error('No audio loaded');
     const { env, fps, shift } = this.onset;
     const curve = estimateTempoCurve(env, fps, { minBpm, maxBpm, priorBpm });
-    const period = curve.period;
+    let period = curve.period;
     if (tempoScale !== 1) for (let i = 0; i < period.length; i++) period[i] /= tempoScale;
-    const beats = Array.from(trackBeats(env, fps, period), (t) => t + shift);
-    return { beats, curve: { times: Array.from(curve.times, (t) => t + shift), bpm: Array.from(curve.bpm, (b) => b * tempoScale) } };
+    const run = (p) => trackBeats(env, fps, p);
+    let beats = Array.from(run(period));
+    let meter = null;
+    if (meterFix) {
+      const onsets = pickOnsets(env, fps);
+      const repair = repairMetricalLevel(beats, onsets, fps, period, run);
+      period = repair.period;
+      beats = fitBeatsToOnsets(repair.beats, onsets);
+      const span = (s) => ({ from: s.from + shift, to: s.to + shift, ratio: s.ratio, trackedBpm: s.trackedBpm, bpm: s.bpm });
+      meter = {
+        dominantBpm: repair.dominant,
+        fixed: repair.spans.filter((s) => s.confirmed).map(span),
+        kept: repair.spans.filter((s) => !s.confirmed).map(span),
+        offGrid: gridCheck(beats, onsets).map((w) => ({ ...w, from: w.from + shift, to: w.to + shift })),
+      };
+    }
+    // The tempo curve as tracked, after any repair.
+    const curveBpm = Array.from(curve.times, (t, w) => (period.length ? (60 * fps) / period[Math.min(period.length - 1, Math.round(t * fps))] : curve.bpm[w] * tempoScale));
+    return {
+      beats: beats.map((t) => t + shift),
+      curve: { times: Array.from(curve.times, (t) => t + shift), bpm: curveBpm },
+      meter,
+    };
   }
 
   // Drum activations (kick, snare, cymbal, high) of the best drum audio we

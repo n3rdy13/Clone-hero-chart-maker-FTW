@@ -17,6 +17,18 @@ The chart's timing comes from the recording, not from the tab. This is the appro
    change is detected and left sharp, so the first beat at the new tempo stays where it was played.
    You can trade detail for fewer tempo events (within ±10, 20 or 40 ms). If you have the song's DAW
    session, its tempo map can be used instead (below).
+
+   **3:2 errors.** A beat tracker can lock onto 2/3 or 3/2 of the real tempo for a long stretch,
+   usually starting where there's no clear backbeat. Stavesacre's "Stars and Clouds" is a steady
+   128 BPM, but its tom-groove intro (kick only every 2 bars) was read as 85 BPM, and much of the
+   song stayed there. Straight 128 BPM eighths can't sit on an 85 BPM grid, so notes snapped to it
+   were up to 85 ms off. Now any stretch tracked at 2/3, 3/2, half or double the song's main tempo is
+   checked against where the drum hits land. If the hits fit 16th notes at the main tempo clearly
+   better, that stretch is tracked again at the main tempo. Then every beat is fitted to the drum
+   hits around it. The app lists the stretches it fixed, and warns about any stretch where more than
+   1.5% of the hits still miss the 16th grid by over 25 ms. A song that really changes tempo by 3:2
+   is left alone when its hits fit the new tempo. If a fix is wrong, untick *Fix stretches tracked
+   at 2/3, 3/2, half or double tempo* (`--no-meter-fix` on the command line).
 2. **The tab is placed on those beats by musical position.** Tab beat *b* lands on recording beat
    *offset + b*. The tab's own tempo is ignored, so a tab at a rounded 96 BPM still lines up with a
    band that drifts between 95.5 and 96.9.
@@ -141,10 +153,11 @@ node frontend/convert.mjs --midi tab.mid --audio song.m4a --stem drums.m4a \
   --artist "Natalie Imbruglia" --song "Torn" --starpower
 ```
 
-It prints the tempo map, where the tab was placed (with any close calls), and the bar.beat of every
-flagged kick. Add `--daw session.rpp` (or `.mid` / `.dawproject`) to use a DAW tempo map,
-`--drop-unsupported-kicks` to remove flagged kicks, `--offset <beats>` to place the tab by hand, or
-`--detect` to chart detected drums instead of a tab. The song folder is written to your
+It prints the tempo map, any stretches re-tracked after a 3:2 error, where the tab was placed (with
+any close calls), and the bar.beat of every flagged kick. Add `--daw session.rpp` (or `.mid` /
+`.dawproject`) to use a DAW tempo map, `--drop-unsupported-kicks` to remove flagged kicks,
+`--offset <beats>` to place the tab by hand, `--no-meter-fix` to keep the tracker's tempo where it
+read 2/3 or 3/2 of the song's tempo, or `--detect` to chart detected drums instead of a tab. The song folder is written to your
 Clone Hero `Songs` directory (`--out` to change it).
 
 ### Batch converter

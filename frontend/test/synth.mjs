@@ -106,15 +106,37 @@ export function drumPart(bars, { beatsPerBar = 4, startBeat = 0 } = {}) {
   return hits;
 }
 
-// Renders [{ time, gm }] with simple synthetic drum voices. `music` adds a
-// bass line and chord pad so the drums sit in a full mix.
+// A song in beats with no backbeat for a while: `before` bars of the rock
+// groove above, `toms` bars of a tom groove, then `after` bars of rock. The tom
+// groove repeats every 2 bars: tom accents grouped 3+3+3+3+2+2 eighths (four
+// dotted quarters, then two quarters) and a kick only at the top of the 2 bars.
+// With no snare on 2 and 4, a beat tracker hears the dotted quarters as the
+// beat, which is 2/3 of the real tempo (85 BPM in a 128 BPM song).
+// Returns { hits, bars, tomFrom, tomTo } (tomFrom/tomTo in beats).
+export function tomGroovePart({ before = 8, toms = 8, after = 12 } = {}) {
+  const hits = drumPart(before);
+  const tomFrom = before * 4;
+  for (let pair = 0; pair < toms / 2; pair++) {
+    const b0 = tomFrom + pair * 8;
+    for (const e of [0, 3, 6, 9, 12, 14]) hits.push({ beat: b0 + e / 2, gm: e < 8 ? 43 : 45 });
+    hits.push({ beat: b0, gm: 36 });
+  }
+  const tomTo = tomFrom + toms * 4;
+  hits.push(...drumPart(after, { startBeat: tomTo }));
+  return { hits, bars: before + toms + after, tomFrom, tomTo };
+}
+
+// Renders [{ time, gm, vel? }] with simple synthetic drum voices (vel scales
+// the hit, default 1). `music` adds a bass line and chord pad so the drums sit
+// in a full mix.
 export function renderHits(hits, duration, { sr = 22050, noise = 0.02, seed = 3, music = false } = {}) {
   const rand = mulberry32(seed);
   const out = new Float32Array(Math.ceil(duration * sr));
+  let gain = 1;
   const add = (at, len, fn) => {
     const s0 = Math.round(at * sr);
     const n = Math.round(len * sr);
-    for (let i = 0; i < n && s0 + i < out.length; i++) if (s0 + i >= 0) out[s0 + i] += fn(i / sr);
+    for (let i = 0; i < n && s0 + i < out.length; i++) if (s0 + i >= 0) out[s0 + i] += gain * fn(i / sr);
   };
   // One-pole high-pass state per voice call keeps cymbals bright.
   const bright = (level, decay) => {
@@ -134,7 +156,8 @@ export function renderHits(hits, duration, { sr = 22050, noise = 0.02, seed = 3,
     42: voices.hat, 44: voices.hat, 46: voices.hat, 49: voices.crash, 57: voices.crash, 52: voices.crash, 55: voices.crash,
     51: voices.ride, 59: voices.ride, 48: voices.tom(220), 50: voices.tom(260), 45: voices.tom(160), 47: voices.tom(180), 41: voices.tom(100), 43: voices.tom(120),
   };
-  for (const h of hits) byGm[h.gm]?.(h.time);
+  for (const h of hits) { gain = h.vel ?? 1; byGm[h.gm]?.(h.time); }
+  gain = 1;
   const roots = [55, 55 * 1.335, 55 * 1.498, 55 * 1.26];
   for (let i = 0; i < out.length; i++) {
     const t = i / sr;

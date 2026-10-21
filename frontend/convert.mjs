@@ -17,6 +17,7 @@
 //   --detect                   chart detected drums instead of a MIDI tab
 //   --drop-unsupported-kicks   remove tab kicks the drum stem doesn't back up (default: just report them)
 //   --offset <beats>           place the tab by hand (grid beat of tab beat 0)
+//   --no-meter-fix             keep stretches the beat tracker read at 2/3, 3/2, half or double tempo
 //   --starpower --density 8    auto star power, one phrase per N bars
 //   --section ExpertDrums  --track <index>  --charter <name>  --out "<dir>"
 
@@ -49,7 +50,7 @@ const resolveFfmpeg = () => {
 };
 
 // --- arg parsing ------------------------------------------------------------
-const FLAGS = new Set(['starpower', 'detect', 'drop-unsupported-kicks']);
+const FLAGS = new Set(['starpower', 'detect', 'drop-unsupported-kicks', 'no-meter-fix']);
 const parseArgs = (argv) => {
   const opts = { section: 'ExpertDrums', density: 8, out: DEFAULT_OUT };
   const positionals = [];
@@ -152,8 +153,14 @@ const main = async () => {
       ? `      drum stem lines up with the song (offset ${(summary.stem.shift * 1000).toFixed(1)} ms, match ${summary.stem.match.toFixed(2)})`
       : `      WARNING: the drum stem doesn't match the song (match ${summary.stem.match.toFixed(2)}); using the song for beats, kick check off`);
   }
-  const { beats } = analyzer.track(DEFAULT_TRACKING);
+  const { beats, meter } = analyzer.track({ ...DEFAULT_TRACKING, meterFix: !opts['no-meter-fix'] });
   console.log(`      ${beats.length} beats from the ${summary.beatSource === 'stem' ? 'drum stem' : 'song'}; detecting drums…`);
+  if (meter) {
+    const range = (s) => `${fmtTime(s.from)}–${fmtTime(s.to)}`;
+    for (const s of meter.fixed) console.log(`      fixed ${range(s)}: tracked at ${s.trackedBpm.toFixed(1)} BPM, re-tracked at ${s.bpm.toFixed(1)} (song tempo ${meter.dominantBpm.toFixed(1)}; --no-meter-fix keeps the tracked tempo)`);
+    for (const s of meter.kept) console.log(`      kept ${range(s)} at ${s.trackedBpm.toFixed(1)} BPM: the drum hits don't fit ${s.bpm.toFixed(1)} any better, so it may be a real tempo change`);
+    for (const w of meter.offGrid) console.log(`      WARNING: ${(w.share * 100).toFixed(0)}% of drum hits miss the 16th grid at ${range(w)}; check the tempo map there`);
+  }
   const acts = analyzer.transcribe();
   let dawBeats = null;
   if (opts.daw) {

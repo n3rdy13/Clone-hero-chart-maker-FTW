@@ -195,6 +195,85 @@ export function smoothBeats(beats, { smooth = 2, iterations = 8 } = {}) {
   return Array.from(T);
 }
 
+// Fits beat times to the drum onsets around them: a regularised least-squares
+// fit in which each onset pulls the grid point nearest to it (a fixed
+// fraction of its beat) onto itself, with a second-difference penalty on the
+// beats and a weak pull back to where the tracker put them.
+//
+// The first passes use only strong onsets (kick, snare, toms: the loudest
+// third or so) snapped to eighths, so the grid's phase is pinned by the hits
+// least likely to be ghost notes. Later passes snap every onset to 16ths.
+// Doing 16ths straight away lets the fit slip by a 16th when the band rushes:
+// every hit then finds a neighbouring 16th and the error never shows.
+//
+// Onsets far from any grid point (flams, triplets, a swung note) are charged
+// with a redescending (Cauchy) weight, so they barely pull at all. The
+// smoothness term is edge-preserving and skipped at sudden tempo changes, as
+// in smoothBeats.
+export function fitBeatsToOnsets(beats, onsets, {
+  smooth = 0.5, prior = 0.02, strongShare = 0.35, iterations = [[2, 'strong', 0.04], [2, 'all', 0.02], [3, 'all', 0.012]],
+} = {}) {
+  const n = beats.length;
+  if (n < 5 || !onsets.length) return Array.from(beats);
+  const B = Float64Array.from(beats);
+  const inRange = onsets.filter((o) => o.time > B[0] && o.time < B[n - 1]);
+  if (inRange.length < n / 2) return Array.from(beats);
+  const strengths = inRange.map((o) => o.strength).sort((a, b) => b - a);
+  const strongMin = strengths[Math.max(0, Math.floor(strongShare * strengths.length) - 1)];
+  // Strengths are capped at a typical strong hit so no one onset dominates.
+  const cap = strengths[Math.floor(0.1 * strengths.length)];
+  const jumps = new Set(tempoJumps(beats).map((j) => j.beat));
+  // Weights of the regularising terms, scaled to the data: the onset weight
+  // a typical beat carries.
+  let total = 0;
+  for (const o of inRange) total += Math.min(cap, o.strength);
+  const perBeat = total / (n - 1);
+  const wSmooth = smooth * perBeat;
+  const wPrior = prior * perBeat;
+  const S = 0.005;
+  const C = 0.75;
+
+  let T = Float64Array.from(B);
+  for (const [count, which, scale] of iterations) {
+    const division = which === 'strong' ? 2 : 4;
+    const use = which === 'strong' ? inRange.filter((o) => o.strength >= strongMin) : inRange;
+    for (let it = 0; it < count; it++) {
+      const A = new Float64Array(n * 3);
+      const rhs = new Float64Array(n);
+      const add = (i, j, v) => { if (j < i) [i, j] = [j, i]; A[i * 3 + (j - i)] += v; };
+      let k = 0;
+      for (const o of use) {
+        while (k + 2 < n && T[k + 1] <= o.time) k++;
+        if (o.time < T[k] || o.time > T[k + 1]) continue;
+        const u = (o.time - T[k]) / (T[k + 1] - T[k]);
+        const g = Math.round(u * division) / division;
+        const r = (1 - g) * T[k] + g * T[k + 1] - o.time;
+        const w = Math.min(cap, o.strength) / (1 + (r / scale) ** 2);
+        add(k, k, w * (1 - g) * (1 - g));
+        add(k, k + 1, w * (1 - g) * g);
+        add(k + 1, k + 1, w * g * g);
+        rhs[k] += w * (1 - g) * o.time;
+        rhs[k + 1] += w * g * o.time;
+      }
+      for (let i = 0; i < n; i++) {
+        add(i, i, wPrior);
+        rhs[i] += wPrior * B[i];
+      }
+      for (let i = 1; i + 1 < n; i++) {
+        if (jumps.has(i)) continue;
+        const d2 = Math.abs(T[i - 1] - 2 * T[i] + T[i + 1]) / S;
+        const ws = wSmooth * (d2 <= C ? 1 : C / d2);
+        const ix = [i - 1, i, i + 1];
+        const v = [1, -2, 1];
+        for (let a = 0; a < 3; a++) for (let b = a; b < 3; b++) add(ix[a], ix[b], ws * v[a] * v[b]);
+      }
+      T = solveBanded(A, rhs, n);
+      for (let i = 1; i < n; i++) if (T[i] <= T[i - 1]) T[i] = T[i - 1] + 1e-4;
+    }
+  }
+  return Array.from(T);
+}
+
 // Sudden tempo changes: beats where the beat length steps from one steady
 // value to another (a section at a new tempo), as opposed to a gradual
 // speed-up or slow-down. A step is reported when the beat lengths on each
