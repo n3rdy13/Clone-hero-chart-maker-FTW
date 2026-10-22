@@ -146,6 +146,16 @@ On Windows, `CLONE-HERO-CONVERTER.bat` starts both servers from the folder it's 
 browser. (An older copy of the launcher pointed at `C:\clone-hero-converter`, so a shortcut could
 start an old copy of the app.)
 
+### On your phone (GitHub Pages)
+
+`.github/workflows/pages.yml` builds the front end and publishes it to GitHub Pages on every push to
+`main` or `claude/lucid-goodall-aot831`. Open `https://n3rdy13.github.io/Clone-hero-chart-maker-FTW/`
+in a phone browser and add it to the home screen. Beats, drum detection, preview and the chart
+bundle all run in the browser. The ffmpeg backend isn't on Pages, so the bundle's audio is a WAV
+instead of an Ogg. Convert it at home with `BUILD-CH-SONG.bat`, or swap in your own `song.ogg`.
+
+One-time setup: make the repo public, then in **Settings → Pages** set **Source** to **GitHub Actions**.
+
 ### Command line (`BUILD-CH-SONG.bat` / `frontend/convert.mjs`)
 
 ```bash
