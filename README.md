@@ -149,8 +149,9 @@ start an old copy of the app.)
 ### On your phone (GitHub Pages)
 
 `.github/workflows/pages.yml` builds the front end and publishes it to GitHub Pages on every push to
-`main` or `claude/lucid-goodall-aot831`. Open `https://n3rdy13.github.io/Clone-hero-chart-maker-FTW/`
-in a phone browser and add it to the home screen. Beats, drum detection, preview and the chart
+`main` or `claude/lucid-goodall-aot831`. The site is at `https://charts.drumcoach.guru`, so open that in a
+phone browser and add it to the home screen. The `frontend/public/CNAME` file keeps the custom domain
+set across deploys. Beats, drum detection, preview and the chart
 bundle all run in the browser. The ffmpeg backend isn't on Pages, so the bundle's audio is a WAV
 instead of an Ogg. Convert it at home with `BUILD-CH-SONG.bat`, or swap in your own `song.ogg`.
 

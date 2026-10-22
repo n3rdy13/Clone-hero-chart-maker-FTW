@@ -26,8 +26,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build-frontend
-        env:
-          BASE_PATH: /${{ github.event.repository.name }}/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
